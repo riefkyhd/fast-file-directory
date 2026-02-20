@@ -1,0 +1,185 @@
+<Window x:Class="FastFileExplorer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        Title="Fast File Explorer"
+        Icon="/icon/idemia_new.ico"
+        Height="760"
+        Width="1220"
+        MinHeight="580"
+        MinWidth="980"
+        Loaded="Window_Loaded"
+        Closing="Window_Closing">
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0"
+                    Orientation="Horizontal"
+                    Margin="0,0,0,10">
+            <TextBlock Text="Fast File Explorer"
+                       FontSize="21"
+                       FontWeight="SemiBold" />
+            <TextBlock x:Name="VersionText"
+                       Margin="10,8,0,0"
+                       Foreground="#6B7280"
+                       FontSize="12"
+                       Text="v-" />
+        </StackPanel>
+
+        <TextBox Grid.Row="1"
+                 x:Name="SearchBox"
+                 Height="38"
+                 FontSize="16"
+                 VerticalContentAlignment="Center"
+                 KeyUp="SearchBox_KeyUp"
+                 TextChanged="SearchBox_TextChanged"
+                 ToolTip="Name-only search. Example: report 2025" />
+
+        <Grid Grid.Row="2"
+              Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="230" />
+                <ColumnDefinition Width="10" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <Border Grid.Column="0"
+                    BorderBrush="#D7DCE3"
+                    BorderThickness="1"
+                    CornerRadius="6"
+                    Padding="10">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel>
+                        <TextBlock Text="Filter by"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,0,6" />
+
+                        <ListBox x:Name="TypeFilterList"
+                                 SelectionChanged="TypeFilterList_SelectionChanged"
+                                 Margin="0,0,0,12"
+                                 SelectedIndex="0">
+                            <ListBoxItem Tag="All" Content="All" />
+                            <ListBoxItem Tag="Folder" Content="Folder" />
+                            <ListBoxItem Tag="File" Content="File" />
+                            <ListBoxItem Tag="Document" Content="Document" />
+                            <ListBoxItem Tag="Picture" Content="Picture" />
+                            <ListBoxItem Tag="Video" Content="Video" />
+                        </ListBox>
+
+                        <TextBlock Text="Recently modified"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,0,6" />
+
+                        <ListBox x:Name="DateFilterList"
+                                 SelectionChanged="DateFilterList_SelectionChanged"
+                                 SelectedIndex="0">
+                            <ListBoxItem Tag="All" Content="All" />
+                            <ListBoxItem Tag="Last1Day" Content="Last 1 day" />
+                            <ListBoxItem Tag="Last7Days" Content="Last 7 days" />
+                            <ListBoxItem Tag="Last30Days" Content="Last 30 days" />
+                            <ListBoxItem Tag="Last365Days" Content="Last 365 days" />
+                        </ListBox>
+
+                        <Button Content="Reindex"
+                                Click="ReindexButton_Click"
+                                Padding="10,6"
+                                Margin="0,14,0,0" />
+
+                        <CheckBox x:Name="IncludeLowLevelCheckBox"
+                                  Content="Include hidden/system files"
+                                  Margin="0,10,0,0"
+                                  Click="IncludeLowLevelCheckBox_Click"
+                                  ToolTip="Unchecked (default) focuses on user files and is faster." />
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0"
+                           x:Name="StatusText"
+                           Foreground="#374151"
+                           Margin="2,0,0,8"
+                           Text="Ready" />
+
+                <Grid Grid.Row="1">
+                    <ListView x:Name="ResultsList"
+                              MouseDoubleClick="ResultsList_MouseDoubleClick"
+                              PreviewMouseRightButtonDown="ResultsList_PreviewMouseRightButtonDown"
+                              PreviewMouseRightButtonUp="ResultsList_PreviewMouseRightButtonUp"
+                              KeyUp="ResultsList_KeyUp">
+                        <ListView.View>
+                            <GridView>
+                                <GridViewColumn Header="Name"
+                                                Width="430">
+                                    <GridViewColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <StackPanel Orientation="Horizontal">
+                                                <Image Source="{Binding Icon}"
+                                                       Width="16"
+                                                       Height="16"
+                                                       Margin="0,0,8,0" />
+                                                <TextBlock Text="{Binding Name}"
+                                                           VerticalAlignment="Center" />
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </GridViewColumn.CellTemplate>
+                                </GridViewColumn>
+                                <GridViewColumn Header="Path"
+                                                Width="470"
+                                                DisplayMemberBinding="{Binding Directory}" />
+                                <GridViewColumn Header="Type"
+                                                Width="95"
+                                                DisplayMemberBinding="{Binding Type}" />
+                                <GridViewColumn Header="Size"
+                                                Width="100"
+                                                DisplayMemberBinding="{Binding SizeLabel}" />
+                                <GridViewColumn Header="Modified"
+                                                Width="170"
+                                                DisplayMemberBinding="{Binding ModifiedLabel}" />
+                            </GridView>
+                        </ListView.View>
+                    </ListView>
+
+                    <Border x:Name="EmptyStatePanel"
+                            Background="#F8FAFC"
+                            BorderBrush="#D7DCE3"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            Visibility="Visible"
+                            IsHitTestVisible="False"
+                            Padding="22">
+                        <StackPanel HorizontalAlignment="Center"
+                                    VerticalAlignment="Center">
+                            <TextBlock Text="Start typing to search"
+                                       HorizontalAlignment="Center"
+                                       FontSize="22"
+                                       FontWeight="SemiBold"
+                                       Foreground="#111827" />
+                            <TextBlock Text="Search by file or folder name."
+                                       HorizontalAlignment="Center"
+                                       Margin="0,10,0,0"
+                                       Foreground="#4B5563" />
+                            <TextBlock Text="Example: report, project, invoice 2026"
+                                       HorizontalAlignment="Center"
+                                       Margin="0,6,0,0"
+                                       Foreground="#6B7280" />
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>
