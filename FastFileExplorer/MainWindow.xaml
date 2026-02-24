@@ -88,7 +88,8 @@
                             <ListBoxItem Tag="Last365Days" Content="Last 365 days" />
                         </ListBox>
 
-                        <Button Content="Reindex"
+                        <Button x:Name="ReindexButton"
+                                Content="Reindex"
                                 Click="ReindexButton_Click"
                                 Padding="10,6"
                                 Margin="0,14,0,0" />
@@ -119,6 +120,9 @@
                               MouseDoubleClick="ResultsList_MouseDoubleClick"
                               PreviewMouseRightButtonDown="ResultsList_PreviewMouseRightButtonDown"
                               PreviewMouseRightButtonUp="ResultsList_PreviewMouseRightButtonUp"
+                              VirtualizingPanel.IsVirtualizing="True"
+                              VirtualizingPanel.VirtualizationMode="Recycling"
+                              ScrollViewer.CanContentScroll="True"
                               KeyUp="ResultsList_KeyUp">
                         <ListView.View>
                             <GridView>

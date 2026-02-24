@@ -7,6 +7,7 @@ public sealed class AppSettings
 {
     public bool IncludeLowLevelContent { get; init; }
     public string CachePath { get; init; } = string.Empty;
+    public bool ResumeIncompleteIndex { get; init; }
 }
 
 public static class SettingsService
@@ -29,7 +30,8 @@ public static class SettingsService
                     return new AppSettings
                     {
                         IncludeLowLevelContent = settings.IncludeLowLevelContent,
-                        CachePath = NormalizeCachePath(settings.CachePath)
+                        CachePath = NormalizeCachePath(settings.CachePath),
+                        ResumeIncompleteIndex = settings.ResumeIncompleteIndex
                     };
                 }
             }
@@ -42,7 +44,8 @@ public static class SettingsService
         return new AppSettings
         {
             IncludeLowLevelContent = false,
-            CachePath = GetDefaultCachePath()
+            CachePath = GetDefaultCachePath(),
+            ResumeIncompleteIndex = false
         };
     }
 

@@ -1,5 +1,5 @@
 #define AppName "Fast File Explorer"
-#define AppVersion "1.1.0"
+#define AppVersion "1.1.6"
 #define AppPublisher "Fast File Explorer"
 #define AppExeName "FastFileExplorer.exe"
 

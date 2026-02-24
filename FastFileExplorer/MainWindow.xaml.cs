@@ -20,36 +20,40 @@ public partial class MainWindow : Window
     private readonly FileIndexService _indexService = new();
     private readonly FileIconProvider _iconProvider = new();
     private readonly ObservableCollection<SearchResultRow> _rows = [];
-    private readonly DispatcherTimer _searchDebounceTimer;
     private readonly string[] _roots;
     private readonly string _cachePath;
-    private CancellationTokenSource? _searchCts;
-    private readonly SemaphoreSlim _searchGate = new(1, 1);
-    private int _searchRequestId;
+    private CancellationTokenSource? _phaseAFetchCts;
+    private readonly object _searchWorkerLock = new();
+    private SearchWorkItem? _latestSearchWorkItem;
+    private bool _phaseBWorkerRunning;
+    private int _queryVersion;
     private DateTime _lastIndexDrivenSearchUtc = DateTime.MinValue;
+    private string _lastServiceStatus = "Ready";
+    private string _lastSearchQuery = string.Empty;
+    private SearchOptions _lastSearchOptions = new();
+    private IReadOnlyList<IndexedItem> _lastSearchItems = Array.Empty<IndexedItem>();
+    private readonly List<CachedQueryResult> _recentQueryCache = [];
+    private readonly SearchRenderState _searchRenderState = new();
     private bool _includeLowLevelContent;
+    private bool _builtInReady;
     private bool _shellMenuOpen;
     private bool _allowExit;
     private bool _isShuttingDown;
+    private bool _resumeIncompleteIndex;
     private bool _checkpointInProgress;
+    private bool _reindexInProgress;
     private int _lastCheckpointItemCount;
     private DateTime _lastCheckpointUtc = DateTime.MinValue;
     private Forms.NotifyIcon? _trayIcon;
+    private readonly SemaphoreSlim _reindexGate = new(1, 1);
     private readonly DispatcherTimer _checkpointTimer;
-    private const int MaxResults = 450;
+    private const int MaxResults = 80;
+    private const int MaxRecentQueryCacheEntries = 32;
 
-    public MainWindow()
+    private readonly bool _disableTrayIcon;
+
+    public MainWindow(IReadOnlyList<string>? roots = null, string? cachePath = null, bool disableTrayIcon = false)
     {
-        _searchDebounceTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(40)
-        };
-        _searchDebounceTimer.Tick += async (_, _) =>
-        {
-            _searchDebounceTimer.Stop();
-            await RunSearchAsync();
-        };
-
         _checkpointTimer = new DispatcherTimer
         {
             Interval = TimeSpan.FromMinutes(2)
@@ -59,13 +63,18 @@ public partial class MainWindow : Window
         InitializeComponent();
 
         ResultsList.ItemsSource = _rows;
-        _roots = BuildDefaultRoots();
-        _cachePath = SettingsService.GetDefaultCachePath();
+        _disableTrayIcon = disableTrayIcon;
+        _roots = roots?.Where(path => !string.IsNullOrWhiteSpace(path) && Directory.Exists(path))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray()
+                 ?? BuildDefaultRoots();
+        _cachePath = string.IsNullOrWhiteSpace(cachePath) ? SettingsService.GetDefaultCachePath() : cachePath;
 
         _indexService.StatusChanged += message =>
         {
             _ = Dispatcher.BeginInvoke(() =>
             {
+                _lastServiceStatus = message;
                 StatusText.Text = message;
             });
         };
@@ -85,11 +94,14 @@ public partial class MainWindow : Window
                 }
 
                 _lastIndexDrivenSearchUtc = now;
-                QueueSearch();
+                QueueSearch(fromIndexRefresh: true);
             });
         };
 
-        InitializeTrayIcon();
+        if (!_disableTrayIcon)
+        {
+            InitializeTrayIcon();
+        }
     }
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
@@ -103,29 +115,14 @@ public partial class MainWindow : Window
     {
         try
         {
-            StatusText.Text = "Loading index...";
             var settings = SettingsService.Load();
             _includeLowLevelContent = settings.IncludeLowLevelContent;
+            _resumeIncompleteIndex = settings.ResumeIncompleteIndex;
             IncludeLowLevelCheckBox.IsChecked = _includeLowLevelContent;
-
-            SettingsService.MigrateLegacyCacheIfNeeded(_cachePath);
-
-            var loadedFromCache = await _indexService.LoadCacheAsync(_cachePath, _includeLowLevelContent);
-            _indexService.StartWatchersOnly(_roots, _includeLowLevelContent);
-
-            if (!loadedFromCache)
-            {
-                StatusText.Text = _indexService.LastCacheLoadMessage ?? "Cache missing. Building index.";
-                await _indexService.StartOrRebuildIndexAsync(_roots, _includeLowLevelContent);
-                await _indexService.SaveCacheAsync(_cachePath);
-            }
-            else if (!string.IsNullOrWhiteSpace(_indexService.LastCacheLoadMessage))
-            {
-                StatusText.Text = _indexService.LastCacheLoadMessage;
-            }
+            IncludeLowLevelCheckBox.IsEnabled = true;
+            await EnsureBuiltInBackendReadyAsync();
 
             QueueSearch();
-            _checkpointTimer.Start();
         }
         catch
         {
@@ -133,9 +130,48 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task EnsureBuiltInBackendReadyAsync()
+    {
+        if (_builtInReady)
+        {
+            return;
+        }
+
+        StatusText.Text = "Loading built-in index...";
+        SettingsService.MigrateLegacyCacheIfNeeded(_cachePath);
+
+        var loadedFromCache = await _indexService.LoadCacheAsync(_cachePath, _includeLowLevelContent);
+        _indexService.StartWatchersOnly(_roots, _includeLowLevelContent);
+
+        if (!loadedFromCache || _resumeIncompleteIndex)
+        {
+            if (_resumeIncompleteIndex && loadedFromCache)
+            {
+                StatusText.Text = "Resuming indexing without reset...";
+                await _indexService.ContinueIndexAsync(_roots, _includeLowLevelContent);
+            }
+            else
+            {
+                StatusText.Text = _indexService.LastCacheLoadMessage ?? "Cache missing. Building index.";
+                await _indexService.StartOrRebuildIndexAsync(_roots, _includeLowLevelContent);
+            }
+
+            await _indexService.SaveCacheAsync(_cachePath);
+            _resumeIncompleteIndex = false;
+            SaveSettings();
+        }
+        else if (!string.IsNullOrWhiteSpace(_indexService.LastCacheLoadMessage))
+        {
+            StatusText.Text = _indexService.LastCacheLoadMessage;
+        }
+
+        _builtInReady = true;
+        _checkpointTimer.Start();
+    }
+
     private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
-        if (!_allowExit)
+        if (!_allowExit && !_disableTrayIcon)
         {
             e.Cancel = true;
             HideToTray();
@@ -148,24 +184,21 @@ public partial class MainWindow : Window
         }
 
         _isShuttingDown = true;
+        var wasIndexing = _indexService.IsIndexing;
         _checkpointTimer.Stop();
-        _searchDebounceTimer.Stop();
-        _searchCts?.Cancel();
-        _searchCts?.Dispose();
+        _phaseAFetchCts?.Cancel();
+        _phaseAFetchCts?.Dispose();
+        _phaseAFetchCts = null;
         _indexService.CancelIndexing();
+        _resumeIncompleteIndex = wasIndexing;
         SaveSettings();
         DisposeTrayIcon();
-        _indexService.Shutdown(flushPendingChanges: false);
+        _indexService.Shutdown(flushPendingChanges: true, flushTimeoutMs: 9000);
     }
 
     private async void ReindexButton_Click(object sender, RoutedEventArgs e)
     {
-        StatusText.Text = "Reindexing...";
-        _includeLowLevelContent = IncludeLowLevelCheckBox.IsChecked == true;
-        await _indexService.StartOrRebuildIndexAsync(_roots, _includeLowLevelContent);
-        await _indexService.SaveCacheAsync(_cachePath);
-        SaveSettings();
-        QueueSearch();
+        await RunReindexAsync();
     }
 
     private async void IncludeLowLevelCheckBox_Click(object sender, RoutedEventArgs e)
@@ -174,15 +207,35 @@ public partial class MainWindow : Window
         StatusText.Text = _includeLowLevelContent
             ? "Reindexing with hidden/system files on..."
             : "Reindexing with hidden/system files off...";
-
-        await _indexService.StartOrRebuildIndexAsync(_roots, _includeLowLevelContent);
-        await _indexService.SaveCacheAsync(_cachePath);
-        SaveSettings();
-        QueueSearch();
+        await RunReindexAsync();
     }
 
     private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
     {
+        var query = SearchBox.Text;
+        var isEmpty = string.IsNullOrWhiteSpace(query);
+        EmptyStatePanel.Visibility = isEmpty ? Visibility.Visible : Visibility.Collapsed;
+
+        if (isEmpty)
+        {
+            Interlocked.Increment(ref _queryVersion);
+            CancelFastPhaseLookup();
+            lock (_searchWorkerLock)
+            {
+                _latestSearchWorkItem = null;
+            }
+
+            _rows.Clear();
+            ResultsList.SelectedIndex = -1;
+            _lastSearchQuery = string.Empty;
+            _lastSearchItems = Array.Empty<IndexedItem>();
+            _searchRenderState.LastStableQuery = string.Empty;
+            _searchRenderState.LastStableOptions = new SearchOptions();
+            _searchRenderState.LastStableResults = Array.Empty<IndexedItem>();
+            UpdateStatus();
+            return;
+        }
+
         QueueSearch();
     }
 
@@ -403,122 +456,382 @@ public partial class MainWindow : Window
         return ResultsList.SelectedItem as SearchResultRow;
     }
 
-    private void QueueSearch()
+    private void QueueSearch(bool fromIndexRefresh = false)
     {
         if (_shellMenuOpen)
         {
             return;
         }
 
-        Interlocked.Increment(ref _searchRequestId);
-        _searchDebounceTimer.Stop();
-        _searchDebounceTimer.Start();
+        var work = CaptureSearchWorkItem();
+        if (work is null)
+        {
+            if (!fromIndexRefresh)
+            {
+                UpdateStatus();
+            }
+            return;
+        }
+
+        RunFastPhase(work);
+        QueueFullRelevance(work);
     }
 
-    private async Task RunSearchAsync()
+    private SearchWorkItem? CaptureSearchWorkItem()
+    {
+        var query = SearchBox.Text;
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return null;
+        }
+
+        var options = new SearchOptions
+        {
+            ItemFilter = GetSelectedItemFilter(),
+            DateFilter = GetSelectedDateFilter()
+        };
+        var selectedPath = GetSelectedRow()?.FullPath;
+        var scrollViewer = FindDescendant<ScrollViewer>(ResultsList);
+        var previousOffset = scrollViewer?.VerticalOffset ?? 0;
+        var version = Interlocked.Increment(ref _queryVersion);
+
+        return new SearchWorkItem(query, options, version, selectedPath, previousOffset);
+    }
+
+    private void RunFastPhase(SearchWorkItem work)
     {
         if (_shellMenuOpen)
         {
             return;
         }
 
-        var requestId = Volatile.Read(ref _searchRequestId);
-        _searchCts?.Cancel();
-        _searchCts?.Dispose();
-        _searchCts = new CancellationTokenSource();
-        var token = _searchCts.Token;
-        var gateEntered = false;
-        try
+        TryRenderInstantFromCache(work);
+        CancelFastPhaseLookup();
+
+        var cts = new CancellationTokenSource();
+        _phaseAFetchCts = cts;
+        var token = cts.Token;
+
+        _ = Task.Run(() =>
         {
-            await _searchGate.WaitAsync(token);
-            gateEntered = true;
-
-            if (requestId != Volatile.Read(ref _searchRequestId))
+            token.ThrowIfCancellationRequested();
+            return _indexService.SearchFastCandidates(work.Query, work.Options, MaxResults);
+        }, token).ContinueWith(async task =>
+        {
+            if (task.IsCanceled || task.IsFaulted)
             {
                 return;
             }
 
-            var selectedPath = GetSelectedRow()?.FullPath;
-            var scrollViewer = FindDescendant<ScrollViewer>(ResultsList);
-            var previousOffset = scrollViewer?.VerticalOffset ?? 0;
-            var query = SearchBox.Text;
-            var options = new SearchOptions
+            await Dispatcher.InvokeAsync(() =>
             {
-                ItemFilter = GetSelectedItemFilter(),
-                DateFilter = GetSelectedDateFilter()
-            };
+                ApplyFastPhaseResults(work, task.Result);
+            }, DispatcherPriority.Input);
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
 
-            if (string.IsNullOrWhiteSpace(query))
+    private void ApplyFastPhaseResults(SearchWorkItem work, IReadOnlyList<IndexedItem> results)
+    {
+        if (_shellMenuOpen || !IsWorkCurrent(work))
+        {
+            return;
+        }
+
+        if (results.Count == 0)
+        {
+            return;
+        }
+
+        ApplyRenderedResults(work, results, isStable: false, allowEmpty: false);
+    }
+
+    private void QueueFullRelevance(SearchWorkItem work)
+    {
+        lock (_searchWorkerLock)
+        {
+            _latestSearchWorkItem = work;
+            if (_phaseBWorkerRunning)
             {
-                _rows.Clear();
-                ResultsList.SelectedIndex = -1;
-                EmptyStatePanel.Visibility = Visibility.Visible;
-                UpdateStatus();
                 return;
             }
 
-            var results = await Task.Run(() =>
-            {
-                token.ThrowIfCancellationRequested();
-                return _indexService.Search(query, options, MaxResults);
-            }, token);
+            _phaseBWorkerRunning = true;
+        }
 
-            if (token.IsCancellationRequested || _shellMenuOpen || requestId != Volatile.Read(ref _searchRequestId))
-            {
-                return;
-            }
+        _ = Task.Run(ProcessFullRelevanceLoopAsync);
+    }
 
-            EmptyStatePanel.Visibility = Visibility.Collapsed;
-            _rows.Clear();
-            foreach (var item in results)
+    private async Task ProcessFullRelevanceLoopAsync()
+    {
+        while (true)
+        {
+            SearchWorkItem? work;
+            lock (_searchWorkerLock)
             {
-                _rows.Add(ToRow(item));
-            }
-
-            if (!string.IsNullOrWhiteSpace(selectedPath))
-            {
-                var selectedIndex = _rows
-                    .Select((row, index) => new { row, index })
-                    .FirstOrDefault(x => string.Equals(x.row.FullPath, selectedPath, StringComparison.OrdinalIgnoreCase))
-                    ?.index ?? -1;
-
-                if (selectedIndex >= 0)
+                work = _latestSearchWorkItem;
+                if (work is null)
                 {
-                    ResultsList.SelectedIndex = selectedIndex;
+                    _phaseBWorkerRunning = false;
+                    return;
                 }
             }
 
-            _ = Dispatcher.BeginInvoke(() =>
+            IReadOnlyList<IndexedItem> results;
+            try
             {
-                var currentScrollViewer = FindDescendant<ScrollViewer>(ResultsList);
-                if (currentScrollViewer is not null)
-                {
-                    var offset = Math.Clamp(previousOffset, 0, currentScrollViewer.ScrollableHeight);
-                    currentScrollViewer.ScrollToVerticalOffset(offset);
-                }
+                results = await Task.Run(() => _indexService.SearchFullRelevance(work.Query, work.Options, MaxResults));
+            }
+            catch
+            {
+                results = Array.Empty<IndexedItem>();
+            }
+
+            await Dispatcher.InvokeAsync(() =>
+            {
+                ApplyFullPhaseResults(work, results);
             }, DispatcherPriority.Background);
 
-            UpdateStatus();
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected when user types quickly or presses Ctrl+A.
-        }
-        catch
-        {
-            StatusText.Text = "Search failed.";
-        }
-        finally
-        {
-            if (gateEntered)
+            lock (_searchWorkerLock)
             {
-                _searchGate.Release();
+                if (_latestSearchWorkItem is null || _latestSearchWorkItem.Version <= work.Version)
+                {
+                    _phaseBWorkerRunning = false;
+                    return;
+                }
             }
         }
+    }
+
+    private void ApplyFullPhaseResults(SearchWorkItem work, IReadOnlyList<IndexedItem> results)
+    {
+        if (_shellMenuOpen || !IsWorkCurrent(work))
+        {
+            return;
+        }
+
+        if (results.Count == 0 &&
+            _searchRenderState.LastRenderedVersion == work.Version &&
+            _searchRenderState.LastStableResults.Count > 0)
+        {
+            return;
+        }
+
+        ApplyRenderedResults(work, results, isStable: true, allowEmpty: true);
+    }
+
+    private void ApplyRenderedResults(SearchWorkItem work, IReadOnlyList<IndexedItem> results, bool isStable, bool allowEmpty)
+    {
+        if (_shellMenuOpen || !IsWorkCurrent(work))
+        {
+            return;
+        }
+
+        if (results.Count == 0 && !allowEmpty)
+        {
+            return;
+        }
+
+        _lastSearchQuery = work.Query;
+        _lastSearchOptions = work.Options;
+        _lastSearchItems = results;
+        CacheRecentQuery(work.Query, work.Options, results);
+
+        _searchRenderState.LastRenderedVersion = work.Version;
+        _searchRenderState.LastStableQuery = work.Query;
+        _searchRenderState.LastStableOptions = work.Options;
+        if (results.Count > 0 || isStable)
+        {
+            _searchRenderState.LastStableResults = results;
+        }
+
+        RenderResults(results, work.SelectedPath, work.ScrollOffset);
+        UpdateStatus();
+    }
+
+    private bool IsWorkCurrent(SearchWorkItem work)
+    {
+        if (work.Version != Volatile.Read(ref _queryVersion))
+        {
+            return false;
+        }
+
+        if (!string.Equals(SearchBox.Text, work.Query, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var currentOptions = new SearchOptions
+        {
+            ItemFilter = GetSelectedItemFilter(),
+            DateFilter = GetSelectedDateFilter()
+        };
+        return SameOptions(currentOptions, work.Options);
+    }
+
+    private void CancelFastPhaseLookup()
+    {
+        var cts = _phaseAFetchCts;
+        _phaseAFetchCts = null;
+        if (cts is null)
+        {
+            return;
+        }
+
+        cts.Cancel();
+        cts.Dispose();
+    }
+
+    private void TryRenderInstantFromCache(SearchWorkItem work)
+    {
+        var candidate = GetBestInstantCandidate(work.Query, work.Options);
+        if (candidate is null)
+        {
+            return;
+        }
+
+        var filtered = FilterForQuery(candidate, work.Query);
+        if (filtered.Count == 0)
+        {
+            ApplyRenderedResults(work, Array.Empty<IndexedItem>(), isStable: false, allowEmpty: true);
+            return;
+        }
+
+        ApplyRenderedResults(work, filtered, isStable: false, allowEmpty: false);
+    }
+
+    private IReadOnlyList<IndexedItem>? GetBestInstantCandidate(string query, SearchOptions options)
+    {
+        if (!string.IsNullOrWhiteSpace(_lastSearchQuery) &&
+            SameOptions(_lastSearchOptions, options) &&
+            query.StartsWith(_lastSearchQuery, StringComparison.OrdinalIgnoreCase))
+        {
+            return _lastSearchItems;
+        }
+
+        CachedQueryResult? best = null;
+        foreach (var entry in _recentQueryCache)
+        {
+            if (!SameOptions(entry.Options, options))
+            {
+                continue;
+            }
+
+            if (!query.StartsWith(entry.Query, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (best is null || entry.Query.Length > best.Query.Length)
+            {
+                best = entry;
+            }
+        }
+
+        if (best is not null)
+        {
+            return best.Results;
+        }
+
+        if (SameOptions(_lastSearchOptions, options) && _lastSearchItems.Count > 0)
+        {
+            return _lastSearchItems;
+        }
+
+        return null;
+    }
+
+    private static List<IndexedItem> FilterForQuery(IReadOnlyList<IndexedItem> source, string query)
+    {
+        var terms = NormalizeTerms(query);
+        if (terms.Length == 0)
+        {
+            return [];
+        }
+
+        return source
+            .Where(item => terms.All(term => item.NormalizedName.Contains(term, StringComparison.Ordinal)))
+            .Take(MaxResults)
+            .ToList();
+    }
+
+    private void CacheRecentQuery(string query, SearchOptions options, IReadOnlyList<IndexedItem> results)
+    {
+        if (string.IsNullOrWhiteSpace(query) || results.Count == 0)
+        {
+            return;
+        }
+
+        _recentQueryCache.RemoveAll(entry =>
+            string.Equals(entry.Query, query, StringComparison.OrdinalIgnoreCase) &&
+            SameOptions(entry.Options, options));
+        _recentQueryCache.Insert(0, new CachedQueryResult(query, options, results));
+        if (_recentQueryCache.Count > MaxRecentQueryCacheEntries)
+        {
+            _recentQueryCache.RemoveRange(MaxRecentQueryCacheEntries, _recentQueryCache.Count - MaxRecentQueryCacheEntries);
+        }
+    }
+
+    private void RenderResults(IReadOnlyList<IndexedItem> results, string? selectedPath, double previousOffset)
+    {
+        EmptyStatePanel.Visibility = Visibility.Collapsed;
+        _rows.Clear();
+        foreach (var item in results)
+        {
+            _rows.Add(ToRow(item));
+        }
+
+        if (!string.IsNullOrWhiteSpace(selectedPath))
+        {
+            var selectedIndex = _rows
+                .Select((row, index) => new { row, index })
+                .FirstOrDefault(x => string.Equals(x.row.FullPath, selectedPath, StringComparison.OrdinalIgnoreCase))
+                ?.index ?? -1;
+
+            if (selectedIndex >= 0)
+            {
+                ResultsList.SelectedIndex = selectedIndex;
+            }
+        }
+
+        _ = Dispatcher.BeginInvoke(() =>
+        {
+            var currentScrollViewer = FindDescendant<ScrollViewer>(ResultsList);
+            if (currentScrollViewer is not null)
+            {
+                var offset = Math.Clamp(previousOffset, 0, currentScrollViewer.ScrollableHeight);
+                currentScrollViewer.ScrollToVerticalOffset(offset);
+            }
+        }, DispatcherPriority.Background);
+    }
+
+    private static bool SameOptions(SearchOptions left, SearchOptions right)
+    {
+        return left.ItemFilter == right.ItemFilter && left.DateFilter == right.DateFilter;
+    }
+
+    private static string[] NormalizeTerms(string query)
+    {
+        var normalized = new string(query
+            .ToLowerInvariant()
+            .Select(c => char.IsLetterOrDigit(c) ? c : ' ')
+            .ToArray());
+
+        return normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     }
 
     private void UpdateStatus()
     {
+        if (StatusText is null)
+        {
+            return;
+        }
+
+        if (_indexService.IsIndexing)
+        {
+            StatusText.Text = _lastServiceStatus;
+            return;
+        }
+
         var state = _indexService.IsIndexing ? "Indexing" : "Ready";
         var lowLevelLabel = _includeLowLevelContent ? "low-level on" : "low-level off";
         StatusText.Text = $"{state} | Items: {_indexService.ItemCount:N0} | Showing: {_rows.Count:N0} | Roots: {_indexService.WatchedRootsCount:N0} | {lowLevelLabel}";
@@ -606,8 +919,48 @@ public partial class MainWindow : Window
         SettingsService.Save(new AppSettings
         {
             IncludeLowLevelContent = _includeLowLevelContent,
-            CachePath = _cachePath
+            CachePath = _cachePath,
+            ResumeIncompleteIndex = _resumeIncompleteIndex
         });
+    }
+
+    private async Task RunReindexAsync()
+    {
+        if (_reindexInProgress)
+        {
+            StatusText.Text = "Reindex already running...";
+            return;
+        }
+
+        await _reindexGate.WaitAsync();
+        _reindexInProgress = true;
+        try
+        {
+            ReindexButton.IsEnabled = false;
+            IncludeLowLevelCheckBox.IsEnabled = false;
+            StatusText.Text = "Reindexing...";
+            _includeLowLevelContent = IncludeLowLevelCheckBox.IsChecked == true;
+            await _indexService.StartOrRebuildIndexAsync(_roots, _includeLowLevelContent);
+            await _indexService.SaveCacheAsync(_cachePath);
+            _resumeIncompleteIndex = false;
+            SaveSettings();
+            QueueSearch();
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText.Text = "Reindex canceled.";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Reindex failed: {ex.Message}";
+        }
+        finally
+        {
+            _reindexInProgress = false;
+            IncludeLowLevelCheckBox.IsEnabled = true;
+            ReindexButton.IsEnabled = true;
+            _reindexGate.Release();
+        }
     }
 
     private void InitializeTrayIcon()
@@ -795,5 +1148,22 @@ public partial class MainWindow : Window
         public required string ModifiedLabel { get; init; }
         public required IndexedItemKind Kind { get; init; }
         public required ImageSource Icon { get; init; }
+    }
+
+    private sealed record CachedQueryResult(string Query, SearchOptions Options, IReadOnlyList<IndexedItem> Results);
+
+    private sealed record SearchWorkItem(
+        string Query,
+        SearchOptions Options,
+        int Version,
+        string? SelectedPath,
+        double ScrollOffset);
+
+    private sealed class SearchRenderState
+    {
+        public int LastRenderedVersion { get; set; }
+        public string LastStableQuery { get; set; } = string.Empty;
+        public SearchOptions LastStableOptions { get; set; } = new();
+        public IReadOnlyList<IndexedItem> LastStableResults { get; set; } = Array.Empty<IndexedItem>();
     }
 }

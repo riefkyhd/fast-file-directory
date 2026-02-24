@@ -13,8 +13,16 @@ public partial class App : System.Windows.Application
     protected override void OnStartup(StartupEventArgs e)
     {
         var runInBackground = e.Args.Any(arg => string.Equals(arg, "--background", StringComparison.OrdinalIgnoreCase));
+        var runInTestMode = e.Args.Any(arg => string.Equals(arg, "--test-mode", StringComparison.OrdinalIgnoreCase));
+        var disableTray = runInTestMode || e.Args.Any(arg => string.Equals(arg, "--no-tray", StringComparison.OrdinalIgnoreCase));
+        var cacheOverride = GetOptionValue(e.Args, "--cache=");
+        var rootsOverride = e.Args
+            .Where(arg => arg.StartsWith("--root=", StringComparison.OrdinalIgnoreCase))
+            .Select(arg => arg.Substring("--root=".Length).Trim().Trim('"'))
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .ToArray();
 
-        if (!runInBackground)
+        if (!runInBackground && !runInTestMode)
         {
             if (!TryAcquireSingleInstance())
             {
@@ -57,7 +65,10 @@ public partial class App : System.Windows.Application
             return;
         }
 
-        MainWindow = new MainWindow();
+        MainWindow = new MainWindow(
+            roots: rootsOverride.Length > 0 ? rootsOverride : null,
+            cachePath: cacheOverride,
+            disableTrayIcon: disableTray);
         MainWindow.Show();
     }
 
@@ -183,5 +194,22 @@ public partial class App : System.Windows.Application
             Name = "FastFileExplorer.ActivationListener"
         };
         _activateListenerThread.Start();
+    }
+
+    private static string? GetOptionValue(string[] args, string optionPrefix)
+    {
+        var arg = args.FirstOrDefault(a => a.StartsWith(optionPrefix, StringComparison.OrdinalIgnoreCase));
+        if (arg is null)
+        {
+            return null;
+        }
+
+        var raw = arg.Substring(optionPrefix.Length).Trim();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        return raw.Trim('"');
     }
 }

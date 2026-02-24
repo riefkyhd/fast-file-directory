@@ -55,6 +55,14 @@
         "net9.0-windows7.0": {
           "targetAlias": "net9.0-windows",
           "dependencies": {
+            "FlaUI.Core": {
+              "target": "Package",
+              "version": "[5.0.0, )"
+            },
+            "FlaUI.UIA3": {
+              "target": "Package",
+              "version": "[5.0.0, )"
+            },
             "MSTest.TestAdapter": {
               "target": "Package",
               "version": "[3.4.0, )"
@@ -95,7 +103,7 @@
       }
     },
     "D:\\Personal\\photography-portfolio\\photo-portfolio\\FastFileExplorer\\FastFileExplorer.csproj": {
-      "version": "1.1.0",
+      "version": "1.1.6",
       "restore": {
         "projectUniqueName": "D:\\Personal\\photography-portfolio\\photo-portfolio\\FastFileExplorer\\FastFileExplorer.csproj",
         "projectName": "FastFileExplorer",

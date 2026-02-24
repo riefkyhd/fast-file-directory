@@ -21,14 +21,19 @@ public sealed class FileIndexService : IDisposable
     };
 
     private const int MaxCacheItems = 10_000_000;
-    private const int MaxFlushUpsertsPerCycle = 8_000;
-    private const int MaxFlushDeletesPerCycle = 8_000;
+    private const int MaxFlushUpsertsPerCycle = 4_000;
+    private const int MaxFlushDeletesPerCycle = 4_000;
+    private const int FastSearchCandidateMultiplier = 4;
+    private const int FullSearchCandidateMultiplier = 12;
+    private const int FastSearchMaxCandidates = 400;
+    private const int FullSearchMaxCandidates = 4000;
     private readonly List<FileSystemWatcher> _watchers = [];
     private readonly object _watcherLock = new();
     private readonly object _storeLock = new();
     private readonly ConcurrentDictionary<string, IndexedItem> _pendingUpserts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _pendingDeletes = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _flushGate = new(1, 1);
+    private readonly SemaphoreSlim _rebuildGate = new(1, 1);
 
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _persistCts;
@@ -132,34 +137,59 @@ public sealed class FileIndexService : IDisposable
 
     public async Task StartOrRebuildIndexAsync(IReadOnlyList<string> roots, bool includeLowLevelContent)
     {
-        CancelIndexing();
-        EnsureStore(_storePath ?? SettingsService.GetDefaultCachePath());
+        await RunIndexAsync(roots, includeLowLevelContent, resetExistingIndex: true);
+    }
 
-        _scanCts = new CancellationTokenSource();
-        var token = _scanCts.Token;
-        _includeLowLevelContent = includeLowLevelContent;
+    public async Task ContinueIndexAsync(IReadOnlyList<string> roots, bool includeLowLevelContent)
+    {
+        await RunIndexAsync(roots, includeLowLevelContent, resetExistingIndex: false);
+    }
 
-        _isIndexing = true;
-        PublishStatus("Reindexing...");
-        Interlocked.Exchange(ref _itemCount, 0);
-        Interlocked.Exchange(ref _lastCountRefreshUtcTicks, DateTime.UtcNow.Ticks);
-
-        _pendingUpserts.Clear();
-        _pendingDeletes.Clear();
-        _store!.ResetIndex(includeLowLevelContent);
-
-        ConfigureWatchers(roots);
+    private async Task RunIndexAsync(IReadOnlyList<string> roots, bool includeLowLevelContent, bool resetExistingIndex)
+    {
+        await _rebuildGate.WaitAsync();
         try
         {
+            CancelIndexing();
+            EnsureStore(_storePath ?? SettingsService.GetDefaultCachePath());
+
+            _scanCts = new CancellationTokenSource();
+            var token = _scanCts.Token;
+            _includeLowLevelContent = includeLowLevelContent;
+
+            _isIndexing = true;
+            if (resetExistingIndex)
+            {
+                PublishStatus("Reindexing...");
+                Interlocked.Exchange(ref _itemCount, 0);
+                Interlocked.Exchange(ref _lastCountRefreshUtcTicks, DateTime.UtcNow.Ticks);
+                _pendingUpserts.Clear();
+                _pendingDeletes.Clear();
+                _store!.ResetIndex(includeLowLevelContent);
+            }
+            else
+            {
+                PublishStatus("Continuing index from cache...");
+            }
+
             await Task.Run(() => BuildIndexFromRoots(roots, token), token);
+            ConfigureWatchers(roots);
             await FlushPendingChangesAsync(refreshItemCount: true, flushAll: true);
+        }
+        catch (OperationCanceledException)
+        {
+            PublishStatus("Reindex canceled");
+            return;
         }
         finally
         {
             _isIndexing = false;
+            _rebuildGate.Release();
         }
 
-        PublishStatus($"Index ready: {ItemCount:N0} items");
+        PublishStatus(resetExistingIndex
+            ? $"Index ready: {ItemCount:N0} items"
+            : $"Index resumed: {ItemCount:N0} items");
         NotifyIndexChanged(force: true);
     }
 
@@ -170,15 +200,94 @@ public sealed class FileIndexService : IDisposable
         PublishStatus($"Watching {WatchedRootsCount:N0} roots");
     }
 
-    public IReadOnlyList<IndexedItem> Search(string query, SearchOptions options, int limit)
+    public IReadOnlyList<IndexedItem> SearchFastCandidates(string query, SearchOptions options, int limit)
     {
-        if (_store is null)
+        return SearchCore(query, options, limit, SearchMode.FastCandidates);
+    }
+
+    public IReadOnlyList<IndexedItem> SearchFullRelevance(string query, SearchOptions options, int limit)
+    {
+        return SearchCore(query, options, limit, SearchMode.FullRelevance);
+    }
+
+    public IReadOnlyList<IndexedItem> Search(string query, SearchOptions options, int limit, bool preferFast = false)
+    {
+        return preferFast
+            ? SearchFastCandidates(query, options, limit)
+            : SearchFullRelevance(query, options, limit);
+    }
+
+    private IReadOnlyList<IndexedItem> SearchCore(string query, SearchOptions options, int limit, SearchMode mode)
+    {
+        if (limit <= 0)
         {
             return [];
         }
 
         var normalized = NormalizeText(query);
-        return _store.Search(normalized, options, limit);
+        var terms = SplitTerms(normalized);
+        if (terms.Length == 0)
+        {
+            return [];
+        }
+
+        var candidateLimit = mode == SearchMode.FastCandidates
+            ? Math.Min(FastSearchMaxCandidates, Math.Max(limit, limit * FastSearchCandidateMultiplier))
+            : Math.Min(FullSearchMaxCandidates, Math.Max(limit, limit * FullSearchCandidateMultiplier));
+
+        var persistedResults = Array.Empty<IndexedItem>();
+        var persistedSearchFailed = false;
+        if (_store is not null)
+        {
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    persistedResults = mode == SearchMode.FastCandidates
+                        ? _store.SearchFastCandidates(normalized, options, candidateLimit).ToArray()
+                        : _store.SearchFullRelevance(normalized, options, candidateLimit, allowContainsFallback: true).ToArray();
+                    break;
+                }
+                catch when (attempt < 2)
+                {
+                    Thread.Sleep(20);
+                }
+                catch
+                {
+                    persistedSearchFailed = true;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            persistedSearchFailed = true;
+        }
+
+        var pendingResults = SearchPendingCandidates(normalized, options, candidateLimit);
+        if (persistedSearchFailed)
+        {
+            return SortDeterministically(pendingResults, terms, mode, limit);
+        }
+
+        var pendingDeletesSnapshot = _pendingDeletes.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var mergedByPath = new Dictionary<string, IndexedItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in persistedResults)
+        {
+            if (pendingDeletesSnapshot.Contains(item.FullPath))
+            {
+                continue;
+            }
+
+            mergedByPath[item.FullPath] = item;
+        }
+
+        foreach (var item in pendingResults)
+        {
+            mergedByPath[item.FullPath] = item;
+        }
+
+        return SortDeterministically(mergedByPath.Values, terms, mode, limit);
     }
 
     public void CancelIndexing()
@@ -218,7 +327,7 @@ public sealed class FileIndexService : IDisposable
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromMilliseconds(600), token);
+                    await Task.Delay(TimeSpan.FromMilliseconds(120), token);
                     await FlushPendingChangesAsync();
                 }
                 catch (OperationCanceledException)
@@ -402,46 +511,119 @@ public sealed class FileIndexService : IDisposable
 
     private void BuildIndexFromRoots(IReadOnlyList<string> roots, CancellationToken token)
     {
-        var orderedRoots = OrderRoots(roots);
-        var options = new ParallelOptions
-        {
-            CancellationToken = token,
-            MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount * 2)
-        };
-
+        var orderedRoots = GetEffectiveRoots(OrderRoots(roots));
         var scanned = 0;
+        var errors = new ConcurrentQueue<string>();
         try
         {
-            Parallel.ForEach(orderedRoots, options, root =>
+            var parallelOptions = new ParallelOptions
             {
-                PublishStatus($"Indexing {root}...");
-                TraverseRoot(root, token, _includeLowLevelContent, onDirectory: dir =>
+                CancellationToken = token,
+                MaxDegreeOfParallelism = Math.Max(2, Math.Min(Math.Max(2, Environment.ProcessorCount), orderedRoots.Count == 0 ? 2 : orderedRoots.Count))
+            };
+
+            Parallel.ForEach(orderedRoots, parallelOptions, root =>
+            {
+                try
                 {
-                    AddOrUpdateDirectory(dir);
-                    var current = Interlocked.Increment(ref scanned);
-                    if (current % 8000 == 0)
+                    parallelOptions.CancellationToken.ThrowIfCancellationRequested();
+                    PublishStatus($"Indexing {root}...");
+
+                    TraverseRoot(root, parallelOptions.CancellationToken, _includeLowLevelContent, onDirectory: dir =>
                     {
-                        Interlocked.Exchange(ref _itemCount, current);
-                        PublishStatus($"Indexing {root}... {current:N0} items");
-                        NotifyIndexChanged();
-                    }
-                }, onFile: file =>
+                        AddOrUpdateDirectory(dir);
+                        var current = Interlocked.Increment(ref scanned);
+                        if (current % 8000 == 0)
+                        {
+                            PublishStatus($"Indexing... scanned {current:N0} items");
+                            if (current % 24000 == 0)
+                            {
+                                _ = SafeFlushCheckpointAsync();
+                            }
+                            NotifyIndexChanged();
+                        }
+                    }, onFile: file =>
+                    {
+                        AddOrUpdateFile(file);
+                        var current = Interlocked.Increment(ref scanned);
+                        if (current % 8000 == 0)
+                        {
+                            PublishStatus($"Indexing... scanned {current:N0} items");
+                            if (current % 24000 == 0)
+                            {
+                                _ = SafeFlushCheckpointAsync();
+                            }
+                            NotifyIndexChanged();
+                        }
+                    });
+                }
+                catch (OperationCanceledException)
                 {
-                    AddOrUpdateFile(file);
-                    var current = Interlocked.Increment(ref scanned);
-                    if (current % 8000 == 0)
-                    {
-                        Interlocked.Exchange(ref _itemCount, current);
-                        PublishStatus($"Indexing {root}... {current:N0} items");
-                        NotifyIndexChanged();
-                    }
-                });
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    errors.Enqueue($"{root}: {ex.Message}");
+                }
             });
         }
         catch (OperationCanceledException)
         {
             PublishStatus("Index canceled");
+            return;
         }
+        catch (AggregateException ex) when (ex.InnerExceptions.All(inner => inner is OperationCanceledException))
+        {
+            PublishStatus("Index canceled");
+            return;
+        }
+        catch (AggregateException ex)
+        {
+            errors.Enqueue($"parallel indexing: {ex.Flatten().Message}");
+        }
+
+        if (!errors.IsEmpty)
+        {
+            var sample = string.Join(" | ", errors.Take(3));
+            PublishStatus($"Indexing completed with {errors.Count} root error(s): {sample}");
+        }
+    }
+
+    private async Task SafeFlushCheckpointAsync()
+    {
+        try
+        {
+            await FlushPendingChangesAsync(refreshItemCount: true);
+        }
+        catch
+        {
+            // Ignore transient flush failures; periodic loop and final flush recover.
+        }
+    }
+
+    private static List<string> GetEffectiveRoots(IReadOnlyList<string> orderedRoots)
+    {
+        var driveRoots = orderedRoots
+            .Where(IsDriveRoot)
+            .Select(root => NormalizeDriveRoot(root))
+            .Where(root => !string.IsNullOrWhiteSpace(root))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var effectiveRoots = new List<string>(orderedRoots.Count);
+        foreach (var root in orderedRoots)
+        {
+            var normalizedDriveRoot = NormalizeDriveRoot(root);
+            if (!IsDriveRoot(root) &&
+                !string.IsNullOrWhiteSpace(normalizedDriveRoot) &&
+                driveRoots.Contains(normalizedDriveRoot))
+            {
+                continue;
+            }
+
+            effectiveRoots.Add(root);
+        }
+
+        return effectiveRoots;
     }
 
     private static List<string> OrderRoots(IReadOnlyList<string> roots)
@@ -484,6 +666,24 @@ public sealed class FileIndexService : IDisposable
         catch
         {
             return false;
+        }
+    }
+
+    private static string? NormalizeDriveRoot(string path)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                return null;
+            }
+
+            return root.TrimEnd('\\') + "\\";
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -585,10 +785,18 @@ public sealed class FileIndexService : IDisposable
                 continue;
             }
 
+            // Drive-root recursive watchers are noisy and unreliable at this scale.
+            // Indexing still scans drives; live watching is focused on user-level roots.
+            if (IsDriveRoot(root))
+            {
+                continue;
+            }
+
             var watcher = new FileSystemWatcher(root)
             {
                 IncludeSubdirectories = true,
                 NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                InternalBufferSize = 64 * 1024,
                 Filter = "*"
             };
 
@@ -600,7 +808,10 @@ public sealed class FileIndexService : IDisposable
                 TryRefreshFromPath(args.FullPath);
             };
             watcher.Deleted += (_, args) => RemoveItem(args.FullPath);
-            watcher.Error += (_, _) => PublishStatus("Watcher warning: one or more directories are unavailable.");
+            watcher.Error += (_, _) =>
+            {
+                // Keep UI stable; watcher faults are non-fatal and periodic indexing preserves correctness.
+            };
             watcher.EnableRaisingEvents = true;
 
             lock (_watcherLock)
@@ -706,6 +917,156 @@ public sealed class FileIndexService : IDisposable
             .Select(c => char.IsLetterOrDigit(c) ? c : ' ')
             .ToArray();
         return new string(chars);
+    }
+
+    private List<IndexedItem> SearchPendingCandidates(
+        string normalizedQuery,
+        SearchOptions options,
+        int candidateLimit)
+    {
+        var terms = SplitTerms(normalizedQuery);
+        if (terms.Length == 0)
+        {
+            return [];
+        }
+
+        var bufferedMatches = new List<IndexedItem>(capacity: Math.Min(candidateLimit * 8, 5000));
+        var pendingSnapshot = _pendingUpserts.Values.ToArray();
+        var deletedSnapshot = _pendingDeletes.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in pendingSnapshot)
+        {
+            if (deletedSnapshot.Contains(item.FullPath))
+            {
+                continue;
+            }
+
+            if (!terms.All(term => item.NormalizedName.Contains(term, StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            if (!PassesItemFilter(item, options.ItemFilter) || !PassesDateFilter(item, options.DateFilter))
+            {
+                continue;
+            }
+
+            bufferedMatches.Add(item);
+        }
+
+        return bufferedMatches
+            .OrderBy(item => GetRelevanceRank(item, terms[0]))
+            .ThenBy(item => item.Kind == IndexedItemKind.Folder ? 0 : 1)
+            .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenByDescending(item => item.LastWriteTimeUtc)
+            .ThenBy(item => item.FullPath, StringComparer.OrdinalIgnoreCase)
+            .Take(candidateLimit)
+            .ToList();
+    }
+
+    private static IReadOnlyList<IndexedItem> SortDeterministically(
+        IEnumerable<IndexedItem> items,
+        string[] terms,
+        SearchMode mode,
+        int limit)
+    {
+        if (limit <= 0)
+        {
+            return [];
+        }
+
+        var firstTerm = terms.Length == 0 ? string.Empty : terms[0];
+
+        if (mode == SearchMode.FastCandidates)
+        {
+            return items
+                .OrderBy(item => GetRelevanceRank(item, firstTerm))
+                .ThenBy(item => item.Kind == IndexedItemKind.Folder ? 0 : 1)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(item => item.FullPath, StringComparer.OrdinalIgnoreCase)
+                .Take(limit)
+                .ToList();
+        }
+
+        return items
+            .OrderBy(item => GetRelevanceRank(item, firstTerm))
+            .ThenBy(item => item.Kind == IndexedItemKind.Folder ? 0 : 1)
+            .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenByDescending(item => item.LastWriteTimeUtc)
+            .ThenBy(item => item.FullPath, StringComparer.OrdinalIgnoreCase)
+            .Take(limit)
+            .ToList();
+    }
+
+    private static string[] SplitTerms(string normalizedQuery)
+    {
+        return normalizedQuery
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private static int GetRelevanceRank(IndexedItem item, string firstTerm)
+    {
+        if (string.IsNullOrWhiteSpace(firstTerm))
+        {
+            return 0;
+        }
+
+        if (item.NormalizedName.StartsWith(firstTerm, StringComparison.Ordinal))
+        {
+            return 0;
+        }
+
+        var wordPrefix = " " + firstTerm;
+        if (item.NormalizedName.Contains(wordPrefix, StringComparison.Ordinal))
+        {
+            return 1;
+        }
+
+        return 2;
+    }
+
+    private enum SearchMode
+    {
+        FastCandidates,
+        FullRelevance
+    }
+
+    private static bool PassesItemFilter(IndexedItem item, ItemFilter filter)
+    {
+        return filter switch
+        {
+            ItemFilter.All => true,
+            ItemFilter.Folder => item.Kind == IndexedItemKind.Folder,
+            ItemFilter.File => item.Kind == IndexedItemKind.File,
+            ItemFilter.Document => item.Kind == IndexedItemKind.File && item.Extension is "txt" or "doc" or "docx" or "pdf" or "rtf" or "ppt" or "pptx" or "xls" or "xlsx" or "csv" or "md",
+            ItemFilter.Picture => item.Kind == IndexedItemKind.File && item.Extension is "jpg" or "jpeg" or "png" or "gif" or "bmp" or "tiff" or "webp" or "heic",
+            ItemFilter.Video => item.Kind == IndexedItemKind.File && item.Extension is "mp4" or "mov" or "avi" or "mkv" or "wmv" or "flv" or "webm",
+            _ => true
+        };
+    }
+
+    private static bool PassesDateFilter(IndexedItem item, DateFilter filter)
+    {
+        if (filter == DateFilter.All)
+        {
+            return true;
+        }
+
+        var minUtc = filter switch
+        {
+            DateFilter.Last1Day => DateTime.UtcNow.AddDays(-1),
+            DateFilter.Last7Days => DateTime.UtcNow.AddDays(-7),
+            DateFilter.Last30Days => DateTime.UtcNow.AddDays(-30),
+            DateFilter.Last365Days => DateTime.UtcNow.AddDays(-365),
+            _ => DateTime.MinValue
+        };
+
+        if (minUtc == DateTime.MinValue)
+        {
+            return true;
+        }
+
+        return item.LastWriteTimeUtc >= minUtc;
     }
 
     private static bool ShouldSkipDirectory(DirectoryInfo directory, string root, bool includeLowLevelContent)

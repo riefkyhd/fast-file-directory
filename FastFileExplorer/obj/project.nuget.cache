@@ -1,12 +1,11 @@
 {
   "version": 2,
-  "dgSpecHash": "nnhdy17I2RM=",
+  "dgSpecHash": "CbE3Ma4sISQ=",
   "success": true,
   "projectFilePath": "D:\\Personal\\photography-portfolio\\photo-portfolio\\FastFileExplorer\\FastFileExplorer.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\muhamhad\\.nuget\\packages\\microsoft.data.sqlite\\9.0.2\\microsoft.data.sqlite.9.0.2.nupkg.sha512",
     "C:\\Users\\muhamhad\\.nuget\\packages\\microsoft.data.sqlite.core\\9.0.2\\microsoft.data.sqlite.core.9.0.2.nupkg.sha512",
-    "C:\\Users\\muhamhad\\.nuget\\packages\\microsoft.net.illink.tasks\\9.0.1\\microsoft.net.illink.tasks.9.0.1.nupkg.sha512",
     "C:\\Users\\muhamhad\\.nuget\\packages\\sqlitepclraw.bundle_e_sqlite3\\2.1.10\\sqlitepclraw.bundle_e_sqlite3.2.1.10.nupkg.sha512",
     "C:\\Users\\muhamhad\\.nuget\\packages\\sqlitepclraw.core\\2.1.10\\sqlitepclraw.core.2.1.10.nupkg.sha512",
     "C:\\Users\\muhamhad\\.nuget\\packages\\sqlitepclraw.lib.e_sqlite3\\2.1.10\\sqlitepclraw.lib.e_sqlite3.2.1.10.nupkg.sha512",

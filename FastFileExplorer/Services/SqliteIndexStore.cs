@@ -67,6 +67,8 @@ public sealed class SqliteIndexStore
             CREATE INDEX IF NOT EXISTS idx_items_directory ON items(directory);
             CREATE INDEX IF NOT EXISTS idx_items_kind ON items(kind);
             CREATE INDEX IF NOT EXISTS idx_items_last_write_ticks ON items(last_write_ticks);
+            CREATE INDEX IF NOT EXISTS idx_items_normalized_name ON items(normalized_name);
+            CREATE INDEX IF NOT EXISTS idx_items_norm_name_sort ON items(normalized_name, name, last_write_ticks);
             """;
         command.ExecuteNonQuery();
     }
@@ -261,7 +263,7 @@ public sealed class SqliteIndexStore
         transaction.Commit();
     }
 
-    public List<IndexedItem> Search(string query, SearchOptions options, int limit)
+    public List<IndexedItem> SearchFastCandidates(string query, SearchOptions options, int limit)
     {
         if (limit <= 0)
         {
@@ -272,18 +274,101 @@ public sealed class SqliteIndexStore
         using var command = connection.CreateCommand();
         var whereParts = new List<string>();
 
-        if (string.IsNullOrWhiteSpace(query))
+        var terms = query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(NormalizeTerm)
+            .Where(term => !string.IsNullOrWhiteSpace(term))
+            .ToArray();
+
+        if (terms.Length == 0)
         {
-            command.CommandText = """
-                SELECT full_path, name, directory, extension, last_write_ticks, size_bytes, kind, normalized_name
-                FROM items
-                ORDER BY last_write_ticks DESC, name COLLATE NOCASE
+            return [];
+        }
+
+        var first = terms[0];
+        var shortSingleTerm = terms.Length == 1 && first.Length <= 2;
+        command.Parameters.AddWithValue("$limit", limit);
+
+        if (shortSingleTerm)
+        {
+            command.Parameters.AddWithValue("$prefix", $"{first}%");
+            whereParts.Add("i.normalized_name LIKE $prefix");
+            ApplyFilters(options, whereParts, command);
+            var whereSql = whereParts.Count == 0
+                ? string.Empty
+                : $"WHERE {string.Join(" AND ", whereParts)}";
+            command.CommandText = $"""
+                SELECT i.full_path, i.name, i.directory, i.extension, i.last_write_ticks, i.size_bytes, i.kind, i.normalized_name
+                FROM items i
+                {whereSql}
                 LIMIT $limit;
                 """;
-            command.Parameters.AddWithValue("$limit", limit);
-            using var reader = command.ExecuteReader();
-            return ReadItems(reader);
+            using var shortReader = command.ExecuteReader();
+            return ReadItems(shortReader);
         }
+
+        ApplyFilters(options, whereParts, command);
+        var useFts = HasFtsRows(connection);
+        if (useFts)
+        {
+            var whereSql = whereParts.Count == 0
+                ? string.Empty
+                : $" AND {string.Join(" AND ", whereParts)}";
+
+            var ftsMatch = string.Join(" AND ", terms.Select(term => $"{term}*"));
+            command.Parameters.AddWithValue("$match", ftsMatch);
+            command.CommandText = $"""
+                SELECT i.full_path, i.name, i.directory, i.extension, i.last_write_ticks, i.size_bytes, i.kind, i.normalized_name
+                FROM items i
+                INNER JOIN items_fts f ON f.full_path = i.full_path
+                WHERE f.normalized_name MATCH $match{whereSql}
+                LIMIT $limit;
+                """;
+
+            using var ftsReader = command.ExecuteReader();
+            var ftsResults = ReadItems(ftsReader);
+            if (ftsResults.Count > 0)
+            {
+                return ftsResults;
+            }
+        }
+
+        using var fallbackCommand = connection.CreateCommand();
+        fallbackCommand.Parameters.AddWithValue("$limit", limit);
+        var fallbackWhereParts = new List<string>();
+        ApplyFilters(options, fallbackWhereParts, fallbackCommand);
+
+        for (var i = 0; i < terms.Length; i++)
+        {
+            var paramName = $"$term{i}";
+            fallbackWhereParts.Add($"i.normalized_name LIKE {paramName}");
+            fallbackCommand.Parameters.AddWithValue(paramName, $"%{terms[i]}%");
+        }
+
+        var fallbackWhereSql = fallbackWhereParts.Count == 0
+            ? string.Empty
+            : $"WHERE {string.Join(" AND ", fallbackWhereParts)}";
+
+        fallbackCommand.CommandText = $"""
+            SELECT i.full_path, i.name, i.directory, i.extension, i.last_write_ticks, i.size_bytes, i.kind, i.normalized_name
+            FROM items i
+            {fallbackWhereSql}
+            LIMIT $limit;
+            """;
+
+        using var fallbackReader = fallbackCommand.ExecuteReader();
+        return ReadItems(fallbackReader);
+    }
+
+    public List<IndexedItem> SearchFullRelevance(string query, SearchOptions options, int limit, bool allowContainsFallback = true)
+    {
+        if (limit <= 0)
+        {
+            return [];
+        }
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        var whereParts = new List<string>();
 
         var terms = query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(NormalizeTerm)
@@ -299,54 +384,13 @@ public sealed class SqliteIndexStore
         var first = terms[0];
         command.Parameters.AddWithValue("$prefix", $"{first}%");
         command.Parameters.AddWithValue("$wordprefix", $"% {first}%");
+        ApplyFilters(options, whereParts, command);
 
-        if (options.ItemFilter != ItemFilter.All)
-        {
-            switch (options.ItemFilter)
-            {
-                case ItemFilter.Folder:
-                    whereParts.Add("i.kind = 1");
-                    break;
-                case ItemFilter.File:
-                    whereParts.Add("i.kind = 0");
-                    break;
-                case ItemFilter.Document:
-                    whereParts.Add("i.kind = 0 AND i.extension IN ('txt','doc','docx','pdf','rtf','ppt','pptx','xls','xlsx','csv','md')");
-                    break;
-                case ItemFilter.Picture:
-                    whereParts.Add("i.kind = 0 AND i.extension IN ('jpg','jpeg','png','gif','bmp','tiff','webp','heic')");
-                    break;
-                case ItemFilter.Video:
-                    whereParts.Add("i.kind = 0 AND i.extension IN ('mp4','mov','avi','mkv','wmv','flv','webm')");
-                    break;
-            }
-        }
-
-        if (options.DateFilter != DateFilter.All)
-        {
-            var minUtc = options.DateFilter switch
-            {
-                DateFilter.Last1Day => DateTime.UtcNow.AddDays(-1),
-                DateFilter.Last7Days => DateTime.UtcNow.AddDays(-7),
-                DateFilter.Last30Days => DateTime.UtcNow.AddDays(-30),
-                DateFilter.Last365Days => DateTime.UtcNow.AddDays(-365),
-                _ => DateTime.MinValue
-            };
-
-            if (minUtc != DateTime.MinValue)
-            {
-                whereParts.Add("i.last_write_ticks >= $minTicks");
-                command.Parameters.AddWithValue("$minTicks", minUtc.Ticks);
-            }
-        }
-
-        var useFts = HasFtsRows(connection);
-        if (useFts)
+        if (HasFtsRows(connection))
         {
             var whereSql = whereParts.Count == 0
                 ? string.Empty
                 : $" AND {string.Join(" AND ", whereParts)}";
-
             var ftsMatch = string.Join(" AND ", terms.Select(term => $"{term}*"));
             command.Parameters.AddWithValue("$match", ftsMatch);
             command.CommandText = $"""
@@ -362,26 +406,42 @@ public sealed class SqliteIndexStore
                     END,
                     CASE WHEN i.kind = 1 THEN 0 ELSE 1 END,
                     i.name COLLATE NOCASE,
-                    i.last_write_ticks DESC
+                    i.last_write_ticks DESC,
+                    i.full_path COLLATE NOCASE
                 LIMIT $limit;
                 """;
 
             using var ftsReader = command.ExecuteReader();
-            return ReadItems(ftsReader);
+            var ftsResults = ReadItems(ftsReader);
+            if (ftsResults.Count > 0)
+            {
+                return ftsResults;
+            }
         }
+
+        if (!allowContainsFallback || terms.Any(term => term.Length < 3))
+        {
+            return [];
+        }
+
+        using var fallbackCommand = connection.CreateCommand();
+        fallbackCommand.Parameters.AddWithValue("$limit", limit);
+        fallbackCommand.Parameters.AddWithValue("$prefix", $"{first}%");
+        fallbackCommand.Parameters.AddWithValue("$wordprefix", $"% {first}%");
+        var fallbackWhereParts = new List<string>();
+        ApplyFilters(options, fallbackWhereParts, fallbackCommand);
 
         for (var i = 0; i < terms.Length; i++)
         {
             var paramName = $"$term{i}";
-            whereParts.Add($"i.normalized_name LIKE {paramName}");
-            command.Parameters.AddWithValue(paramName, $"%{terms[i]}%");
+            fallbackWhereParts.Add($"i.normalized_name LIKE {paramName}");
+            fallbackCommand.Parameters.AddWithValue(paramName, $"%{terms[i]}%");
         }
 
-        var fallbackWhereSql = whereParts.Count == 0
+        var fallbackWhereSql = fallbackWhereParts.Count == 0
             ? string.Empty
-            : $"WHERE {string.Join(" AND ", whereParts)}";
-
-        command.CommandText = $"""
+            : $"WHERE {string.Join(" AND ", fallbackWhereParts)}";
+        fallbackCommand.CommandText = $"""
             SELECT i.full_path, i.name, i.directory, i.extension, i.last_write_ticks, i.size_bytes, i.kind, i.normalized_name
             FROM items i
             {fallbackWhereSql}
@@ -393,14 +453,18 @@ public sealed class SqliteIndexStore
                 END,
                 CASE WHEN i.kind = 1 THEN 0 ELSE 1 END,
                 i.name COLLATE NOCASE,
-                i.last_write_ticks DESC
+                i.last_write_ticks DESC,
+                i.full_path COLLATE NOCASE
             LIMIT $limit;
             """;
 
-        using (var fallbackReader = command.ExecuteReader())
-        {
-            return ReadItems(fallbackReader);
-        }
+        using var fallbackReader = fallbackCommand.ExecuteReader();
+        return ReadItems(fallbackReader);
+    }
+
+    public List<IndexedItem> Search(string query, SearchOptions options, int limit, bool allowContainsFallback = true)
+    {
+        return SearchFullRelevance(query, options, limit, allowContainsFallback);
     }
 
     private static List<IndexedItem> ReadItems(SqliteDataReader reader)
@@ -433,6 +497,53 @@ public sealed class SqliteIndexStore
         return new string(chars);
     }
 
+    private static void ApplyFilters(SearchOptions options, List<string> whereParts, SqliteCommand command)
+    {
+        if (options.ItemFilter != ItemFilter.All)
+        {
+            switch (options.ItemFilter)
+            {
+                case ItemFilter.Folder:
+                    whereParts.Add("i.kind = 1");
+                    break;
+                case ItemFilter.File:
+                    whereParts.Add("i.kind = 0");
+                    break;
+                case ItemFilter.Document:
+                    whereParts.Add("i.kind = 0 AND i.extension IN ('txt','doc','docx','pdf','rtf','ppt','pptx','xls','xlsx','csv','md')");
+                    break;
+                case ItemFilter.Picture:
+                    whereParts.Add("i.kind = 0 AND i.extension IN ('jpg','jpeg','png','gif','bmp','tiff','webp','heic')");
+                    break;
+                case ItemFilter.Video:
+                    whereParts.Add("i.kind = 0 AND i.extension IN ('mp4','mov','avi','mkv','wmv','flv','webm')");
+                    break;
+            }
+        }
+
+        if (options.DateFilter == DateFilter.All)
+        {
+            return;
+        }
+
+        var minUtc = options.DateFilter switch
+        {
+            DateFilter.Last1Day => DateTime.UtcNow.AddDays(-1),
+            DateFilter.Last7Days => DateTime.UtcNow.AddDays(-7),
+            DateFilter.Last30Days => DateTime.UtcNow.AddDays(-30),
+            DateFilter.Last365Days => DateTime.UtcNow.AddDays(-365),
+            _ => DateTime.MinValue
+        };
+
+        if (minUtc == DateTime.MinValue)
+        {
+            return;
+        }
+
+        whereParts.Add("i.last_write_ticks >= $minTicks");
+        command.Parameters.AddWithValue("$minTicks", minUtc.Ticks);
+    }
+
     private bool HasFtsRows(SqliteConnection connection)
     {
         var cached = Volatile.Read(ref _ftsHasRows);
@@ -452,11 +563,11 @@ public sealed class SqliteIndexStore
     {
         var connection = new SqliteConnection(_connectionString);
         connection.Open();
-        connection.DefaultTimeout = 1;
+        connection.DefaultTimeout = 3;
 
         using var command = connection.CreateCommand();
         command.CommandText = """
-            PRAGMA busy_timeout=250;
+            PRAGMA busy_timeout=2500;
             PRAGMA cache_size=-20000;
             PRAGMA temp_store=MEMORY;
             """;
