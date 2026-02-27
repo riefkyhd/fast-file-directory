@@ -259,4 +259,38 @@ public sealed class UnitTests
         }
     }
 
+    [TestMethod]
+    [TestCategory("Unit")]
+    public async Task StartWatchersOnly_DoesNotOverwriteLoadedCacheStatus()
+    {
+        var root = TestDataHelper.CreateTestTree(fileCount: 200, folderCount: 5);
+        var cachePath = TestDataHelper.CreateTempCachePath();
+        try
+        {
+            using (var setupService = new FileIndexService())
+            {
+                _ = await setupService.LoadCacheAsync(cachePath, includeLowLevelContent: true);
+                await setupService.StartOrRebuildIndexAsync(new[] { root }, includeLowLevelContent: true);
+                await setupService.SaveCacheAsync(cachePath);
+            }
+
+            using var service = new FileIndexService();
+            var statusMessages = new List<string>();
+            service.StatusChanged += message => statusMessages.Add(message);
+
+            var loaded = await service.LoadCacheAsync(cachePath, includeLowLevelContent: true);
+            Assert.IsTrue(loaded);
+
+            service.StartWatchersOnly(new[] { root }, includeLowLevelContent: true);
+            Assert.IsTrue(statusMessages.Count > 0, "Expected at least one status message from cache load.");
+            Assert.IsTrue(statusMessages[^1].Contains("Loaded cache", StringComparison.OrdinalIgnoreCase),
+                $"Expected loaded-cache status to remain primary. Last='{statusMessages[^1]}'");
+        }
+        finally
+        {
+            TestDataHelper.DeleteDirectoryWithRetry(root);
+            TestDataHelper.DeleteDirectoryWithRetry(Path.GetDirectoryName(cachePath)!);
+        }
+    }
+
 }

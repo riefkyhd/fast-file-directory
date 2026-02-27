@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Text.Json;
 using FastFileExplorer.Models;
+using Microsoft.Data.Sqlite;
 
 namespace FastFileExplorer.Services;
 
@@ -27,6 +28,9 @@ public sealed class FileIndexService : IDisposable
     private const int FullSearchCandidateMultiplier = 12;
     private const int FastSearchMaxCandidates = 400;
     private const int FullSearchMaxCandidates = 4000;
+    private const int ShadowBuildBatchSize = 5000;
+    private const int ShadowWriteBatchSize = 20000;
+    private const int ShadowQueueCapacity = 120000;
     private readonly List<FileSystemWatcher> _watchers = [];
     private readonly object _watcherLock = new();
     private readonly object _storeLock = new();
@@ -34,6 +38,7 @@ public sealed class FileIndexService : IDisposable
     private readonly ConcurrentDictionary<string, byte> _pendingDeletes = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _flushGate = new(1, 1);
     private readonly SemaphoreSlim _rebuildGate = new(1, 1);
+    private readonly InMemorySearchIndex _memoryIndex = new();
 
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _persistCts;
@@ -66,11 +71,13 @@ public sealed class FileIndexService : IDisposable
 
     public string? LastCacheLoadMessage { get; private set; }
     public string? LastCacheSaveMessage { get; private set; }
+    public string CurrentIndexState { get; private set; } = SqliteIndexStore.IndexStateUnknown;
 
     public async Task<bool> LoadCacheAsync(string cachePath, bool includeLowLevelContent)
     {
         try
         {
+            await Task.Run(() => PromoteCompleteBuildIfAvailable(cachePath));
             await Task.Run(() => EnsureStore(cachePath));
             _includeLowLevelContent = includeLowLevelContent;
 
@@ -104,9 +111,14 @@ public sealed class FileIndexService : IDisposable
                 return false;
             }
 
-            Interlocked.Exchange(ref _itemCount, metadata.ItemCount);
+            var items = await Task.Run(() => _store.LoadAllItems());
+            _memoryIndex.ReplaceAll(items);
+            Interlocked.Exchange(ref _itemCount, _memoryIndex.Count);
             Interlocked.Exchange(ref _lastCountRefreshUtcTicks, DateTime.UtcNow.Ticks);
-            LastCacheLoadMessage = $"Loaded cache: {ItemCount:N0} items";
+            CurrentIndexState = metadata.IndexState;
+            LastCacheLoadMessage = metadata.IndexState == SqliteIndexStore.IndexStateIncomplete
+                ? $"Loaded cache: {ItemCount:N0} items (recovering)"
+                : $"Loaded cache: {ItemCount:N0} items";
             PublishStatus(LastCacheLoadMessage);
             NotifyIndexChanged(force: true);
             return true;
@@ -125,6 +137,20 @@ public sealed class FileIndexService : IDisposable
         {
             EnsureStore(cachePath);
             await FlushPendingChangesAsync(refreshItemCount: true, flushAll: true);
+            if (_store is not null)
+            {
+                _store.SetItemCountCheckpoint(ItemCount);
+                if (_isIndexing)
+                {
+                    _store.SetIndexState(SqliteIndexStore.IndexStateIncomplete);
+                    CurrentIndexState = SqliteIndexStore.IndexStateIncomplete;
+                }
+                else
+                {
+                    _store.MarkFullScanCompleted(ItemCount);
+                    CurrentIndexState = SqliteIndexStore.IndexStateComplete;
+                }
+            }
             LastCacheSaveMessage = $"Cache synced: {ItemCount:N0} items";
             PublishStatus(LastCacheSaveMessage);
         }
@@ -160,21 +186,20 @@ public sealed class FileIndexService : IDisposable
             _isIndexing = true;
             if (resetExistingIndex)
             {
-                PublishStatus("Reindexing...");
-                Interlocked.Exchange(ref _itemCount, 0);
-                Interlocked.Exchange(ref _lastCountRefreshUtcTicks, DateTime.UtcNow.Ticks);
-                _pendingUpserts.Clear();
-                _pendingDeletes.Clear();
-                _store!.ResetIndex(includeLowLevelContent);
+                PublishStatus("Reindexing in background (active index stays searchable)...");
+                await BuildShadowIndexAndSwapAsync(roots, includeLowLevelContent, token);
             }
             else
             {
                 PublishStatus("Continuing index from cache...");
+                _store!.SetIndexState(SqliteIndexStore.IndexStateIncomplete);
+                CurrentIndexState = SqliteIndexStore.IndexStateIncomplete;
+                await Task.Run(() => BuildIndexFromRoots(roots, token), token);
+                await FlushPendingChangesAsync(refreshItemCount: true, flushAll: true);
+                _store.MarkFullScanCompleted(ItemCount);
+                CurrentIndexState = SqliteIndexStore.IndexStateComplete;
             }
-
-            await Task.Run(() => BuildIndexFromRoots(roots, token), token);
             ConfigureWatchers(roots);
-            await FlushPendingChangesAsync(refreshItemCount: true, flushAll: true);
         }
         catch (OperationCanceledException)
         {
@@ -193,11 +218,252 @@ public sealed class FileIndexService : IDisposable
         NotifyIndexChanged(force: true);
     }
 
+    private async Task BuildShadowIndexAndSwapAsync(
+        IReadOnlyList<string> roots,
+        bool includeLowLevelContent,
+        CancellationToken token)
+    {
+        var activePath = _storePath ?? SettingsService.GetDefaultCachePath();
+        var buildPath = SettingsService.GetBuildCachePath(activePath);
+        var buildStore = new SqliteIndexStore(buildPath);
+        buildStore.EnsureInitialized();
+        buildStore.ResetIndex(includeLowLevelContent);
+        buildStore.SetIndexState(SqliteIndexStore.IndexStateIncomplete);
+
+        var scanned = await Task.Run(() => BuildIndexIntoStore(roots, includeLowLevelContent, token, buildStore), token);
+        token.ThrowIfCancellationRequested();
+
+        buildStore.MarkFullScanCompleted(scanned);
+
+        await FlushPendingChangesAsync(refreshItemCount: true, flushAll: true);
+        ReplaceActiveStoreWithBuildStore(activePath, buildPath);
+
+        EnsureStore(activePath);
+        var items = _store!.LoadAllItems();
+        _memoryIndex.ReplaceAll(items);
+        Interlocked.Exchange(ref _itemCount, _memoryIndex.Count);
+        Interlocked.Exchange(ref _lastCountRefreshUtcTicks, DateTime.UtcNow.Ticks);
+        CurrentIndexState = SqliteIndexStore.IndexStateComplete;
+    }
+
+    private int BuildIndexIntoStore(
+        IReadOnlyList<string> roots,
+        bool includeLowLevelContent,
+        CancellationToken token,
+        SqliteIndexStore destinationStore)
+    {
+        var orderedRoots = GetEffectiveRoots(OrderRoots(roots));
+        var scanned = 0;
+        var errors = new ConcurrentQueue<string>();
+        var writeErrors = new ConcurrentQueue<Exception>();
+        using var queue = new BlockingCollection<IndexedItem>(ShadowQueueCapacity);
+
+        var writerTask = Task.Run(() =>
+        {
+            var writeBatch = new List<IndexedItem>(ShadowWriteBatchSize);
+            try
+            {
+                foreach (var item in queue.GetConsumingEnumerable(token))
+                {
+                    writeBatch.Add(item);
+                    if (writeBatch.Count < ShadowWriteBatchSize)
+                    {
+                        continue;
+                    }
+
+                    destinationStore.ApplyChanges(writeBatch, Array.Empty<string>(), includeLowLevelContent);
+                    writeBatch.Clear();
+                }
+
+                if (writeBatch.Count > 0)
+                {
+                    destinationStore.ApplyChanges(writeBatch, Array.Empty<string>(), includeLowLevelContent);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on cancellation.
+            }
+            catch (Exception ex)
+            {
+                writeErrors.Enqueue(ex);
+            }
+        }, token);
+
+        var parallelOptions = new ParallelOptions
+        {
+            CancellationToken = token,
+            MaxDegreeOfParallelism = Math.Max(2, Math.Min(Math.Max(2, Environment.ProcessorCount), orderedRoots.Count == 0 ? 2 : orderedRoots.Count))
+        };
+
+        Parallel.ForEach(orderedRoots, parallelOptions, root =>
+        {
+            var localBatch = new List<IndexedItem>(ShadowBuildBatchSize);
+            void QueueLocalBatch()
+            {
+                if (localBatch.Count == 0)
+                {
+                    return;
+                }
+
+                foreach (var item in localBatch)
+                {
+                    queue.Add(item, parallelOptions.CancellationToken);
+                }
+
+                localBatch.Clear();
+            }
+
+            try
+            {
+                parallelOptions.CancellationToken.ThrowIfCancellationRequested();
+                PublishStatus($"Indexing {root}...");
+                TraverseRoot(root, parallelOptions.CancellationToken, includeLowLevelContent, onDirectory: dir =>
+                {
+                    localBatch.Add(ToIndexedDirectory(dir));
+                    var current = Interlocked.Increment(ref scanned);
+                    if (localBatch.Count >= ShadowBuildBatchSize)
+                    {
+                        QueueLocalBatch();
+                    }
+
+                    if (current % 8000 == 0)
+                    {
+                        PublishStatus($"Indexing... scanned {current:N0} items");
+                        NotifyIndexChanged();
+                    }
+                }, onFile: file =>
+                {
+                    localBatch.Add(ToIndexedFile(file));
+                    var current = Interlocked.Increment(ref scanned);
+                    if (localBatch.Count >= ShadowBuildBatchSize)
+                    {
+                        QueueLocalBatch();
+                    }
+
+                    if (current % 8000 == 0)
+                    {
+                        PublishStatus($"Indexing... scanned {current:N0} items");
+                        NotifyIndexChanged();
+                    }
+                });
+
+                QueueLocalBatch();
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                errors.Enqueue($"{root}: {ex.Message}");
+            }
+        });
+
+        queue.CompleteAdding();
+        writerTask.GetAwaiter().GetResult();
+
+        if (!writeErrors.IsEmpty)
+        {
+            throw new InvalidOperationException($"Shadow index write failed: {writeErrors.First().Message}");
+        }
+
+        if (!errors.IsEmpty)
+        {
+            var sample = string.Join(" | ", errors.Take(3));
+            PublishStatus($"Indexing completed with {errors.Count} root error(s): {sample}");
+        }
+
+        return scanned;
+    }
+
+    private void ReplaceActiveStoreWithBuildStore(string activePath, string buildPath)
+    {
+        lock (_storeLock)
+        {
+            _persistCts?.Cancel();
+            try
+            {
+                _ = _persistTask?.Wait(1500);
+            }
+            catch
+            {
+                // Ignore persistence loop shutdown races during swap.
+            }
+
+            var previousPath = SettingsService.GetPreviousCachePath(activePath);
+            var activeDirectory = Path.GetDirectoryName(activePath);
+            if (!string.IsNullOrWhiteSpace(activeDirectory))
+            {
+                Directory.CreateDirectory(activeDirectory);
+            }
+
+            SqliteConnection.ClearAllPools();
+
+            try
+            {
+                if (File.Exists(previousPath))
+                {
+                    File.Delete(previousPath);
+                }
+            }
+            catch
+            {
+                // Ignore previous backup cleanup failures.
+            }
+
+            if (File.Exists(activePath))
+            {
+                File.Replace(buildPath, activePath, previousPath, ignoreMetadataErrors: true);
+            }
+            else
+            {
+                File.Move(buildPath, activePath, overwrite: true);
+            }
+
+            _store = new SqliteIndexStore(activePath);
+            _store.EnsureInitialized();
+            _storePath = activePath;
+            StartPersistenceLoop();
+        }
+    }
+
+    private void PromoteCompleteBuildIfAvailable(string activePath)
+    {
+        var buildPath = SettingsService.GetBuildCachePath(activePath);
+        if (!File.Exists(buildPath))
+        {
+            return;
+        }
+
+        var buildStore = new SqliteIndexStore(buildPath);
+        buildStore.EnsureInitialized();
+        var buildMetadata = buildStore.TryReadMetadata();
+        if (buildMetadata is null || buildMetadata.IndexState != SqliteIndexStore.IndexStateComplete)
+        {
+            return;
+        }
+
+        var activeStore = new SqliteIndexStore(activePath);
+        if (activeStore.Exists())
+        {
+            activeStore.EnsureInitialized();
+            var activeMetadata = activeStore.TryReadMetadata();
+            if (activeMetadata is not null &&
+                activeMetadata.IndexState == SqliteIndexStore.IndexStateComplete &&
+                activeMetadata.ItemCount >= buildMetadata.ItemCount)
+            {
+                return;
+            }
+        }
+
+        ReplaceActiveStoreWithBuildStore(activePath, buildPath);
+    }
+
     public void StartWatchersOnly(IReadOnlyList<string> roots, bool includeLowLevelContent)
     {
         _includeLowLevelContent = includeLowLevelContent;
         ConfigureWatchers(roots);
-        PublishStatus($"Watching {WatchedRootsCount:N0} roots");
     }
 
     public IReadOnlyList<IndexedItem> SearchFastCandidates(string query, SearchOptions options, int limit)
@@ -232,62 +498,12 @@ public sealed class FileIndexService : IDisposable
         }
 
         var candidateLimit = mode == SearchMode.FastCandidates
-            ? Math.Min(FastSearchMaxCandidates, Math.Max(limit, limit * FastSearchCandidateMultiplier))
+            ? Math.Min(FastSearchMaxCandidates, limit)
             : Math.Min(FullSearchMaxCandidates, Math.Max(limit, limit * FullSearchCandidateMultiplier));
 
-        var persistedResults = Array.Empty<IndexedItem>();
-        var persistedSearchFailed = false;
-        if (_store is not null)
-        {
-            for (var attempt = 0; attempt < 3; attempt++)
-            {
-                try
-                {
-                    persistedResults = mode == SearchMode.FastCandidates
-                        ? _store.SearchFastCandidates(normalized, options, candidateLimit).ToArray()
-                        : _store.SearchFullRelevance(normalized, options, candidateLimit, allowContainsFallback: true).ToArray();
-                    break;
-                }
-                catch when (attempt < 2)
-                {
-                    Thread.Sleep(20);
-                }
-                catch
-                {
-                    persistedSearchFailed = true;
-                    break;
-                }
-            }
-        }
-        else
-        {
-            persistedSearchFailed = true;
-        }
-
-        var pendingResults = SearchPendingCandidates(normalized, options, candidateLimit);
-        if (persistedSearchFailed)
-        {
-            return SortDeterministically(pendingResults, terms, mode, limit);
-        }
-
-        var pendingDeletesSnapshot = _pendingDeletes.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var mergedByPath = new Dictionary<string, IndexedItem>(StringComparer.OrdinalIgnoreCase);
-        foreach (var item in persistedResults)
-        {
-            if (pendingDeletesSnapshot.Contains(item.FullPath))
-            {
-                continue;
-            }
-
-            mergedByPath[item.FullPath] = item;
-        }
-
-        foreach (var item in pendingResults)
-        {
-            mergedByPath[item.FullPath] = item;
-        }
-
-        return SortDeterministically(mergedByPath.Values, terms, mode, limit);
+        return mode == SearchMode.FastCandidates
+            ? _memoryIndex.SearchFastCandidates(normalized, options, candidateLimit).Take(limit).ToList()
+            : _memoryIndex.SearchFullRelevance(normalized, options, candidateLimit).Take(limit).ToList();
     }
 
     public void CancelIndexing()
@@ -358,7 +574,7 @@ public sealed class FileIndexService : IDisposable
                 {
                     if (refreshItemCount)
                     {
-                        Interlocked.Exchange(ref _itemCount, _store.GetItemCount());
+                        Interlocked.Exchange(ref _itemCount, _memoryIndex.Count);
                         Interlocked.Exchange(ref _lastCountRefreshUtcTicks, DateTime.UtcNow.Ticks);
                     }
                     return;
@@ -432,7 +648,7 @@ public sealed class FileIndexService : IDisposable
                     return;
                 }
 
-                Interlocked.Exchange(ref _itemCount, _store.GetItemCount());
+                Interlocked.Exchange(ref _itemCount, _memoryIndex.Count);
                 Interlocked.Exchange(ref _lastCountRefreshUtcTicks, nowTicks);
             });
         }
@@ -495,6 +711,9 @@ public sealed class FileIndexService : IDisposable
                 var batch = importedItems.Skip(i).Take(batchSize).ToList();
                 _store.ApplyChanges(batch, Array.Empty<string>(), includeLowLevelContent);
             }
+            _store.MarkFullScanCompleted(importedItems.Count);
+            _memoryIndex.ReplaceAll(importedItems);
+            CurrentIndexState = SqliteIndexStore.IndexStateComplete;
 
             Interlocked.Exchange(ref _itemCount, importedItems.Count);
             Interlocked.Exchange(ref _lastCountRefreshUtcTicks, DateTime.UtcNow.Ticks);
@@ -855,18 +1074,7 @@ public sealed class FileIndexService : IDisposable
             return;
         }
 
-        var item = new IndexedItem
-        {
-            FullPath = info.FullName,
-            Name = info.Name,
-            Directory = info.Parent?.FullName ?? info.Root.FullName,
-            Extension = "folder",
-            LastWriteTimeUtc = info.Exists ? info.LastWriteTimeUtc : DateTime.UtcNow,
-            SizeBytes = 0,
-            Kind = IndexedItemKind.Folder,
-            NormalizedName = NormalizeText(info.Name)
-        };
-
+        var item = ToIndexedDirectory(info);
         AddOrReplace(item);
     }
 
@@ -878,11 +1086,32 @@ public sealed class FileIndexService : IDisposable
             return;
         }
 
+        var item = ToIndexedFile(info);
+        AddOrReplace(item);
+    }
+
+    private static IndexedItem ToIndexedDirectory(DirectoryInfo info)
+    {
+        return new IndexedItem
+        {
+            FullPath = info.FullName,
+            Name = info.Name,
+            Directory = info.Parent?.FullName ?? info.Root.FullName,
+            Extension = "folder",
+            LastWriteTimeUtc = info.Exists ? info.LastWriteTimeUtc : DateTime.UtcNow,
+            SizeBytes = 0,
+            Kind = IndexedItemKind.Folder,
+            NormalizedName = NormalizeText(info.Name)
+        };
+    }
+
+    private static IndexedItem ToIndexedFile(FileInfo info)
+    {
         var extension = string.IsNullOrWhiteSpace(info.Extension)
             ? "(none)"
             : info.Extension.TrimStart('.').ToLowerInvariant();
 
-        var item = new IndexedItem
+        return new IndexedItem
         {
             FullPath = info.FullName,
             Name = info.Name,
@@ -893,20 +1122,20 @@ public sealed class FileIndexService : IDisposable
             Kind = IndexedItemKind.File,
             NormalizedName = NormalizeText(info.Name)
         };
-
-        AddOrReplace(item);
     }
 
     private void AddOrReplace(IndexedItem item)
     {
         _pendingDeletes.TryRemove(item.FullPath, out _);
         _pendingUpserts[item.FullPath] = item;
+        _memoryIndex.Upsert(item);
     }
 
     private void RemoveItem(string fullPath)
     {
         _pendingUpserts.TryRemove(fullPath, out _);
         _pendingDeletes[fullPath] = 0;
+        _memoryIndex.Remove(fullPath);
         NotifyIndexChanged();
     }
 

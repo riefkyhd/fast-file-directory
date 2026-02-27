@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "b+OB1NuJmY0=",
+  "dgSpecHash": "Fc22VZn8xOY=",
   "success": true,
-  "projectFilePath": "D:\\Personal\\photography-portfolio\\photo-portfolio\\FastFileExplorer.Tests\\FastFileExplorer.Tests.csproj",
+  "projectFilePath": "D:\\Personal\\fast-file-explorer\\FastFileExplorer.Tests\\FastFileExplorer.Tests.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\muhamhad\\.nuget\\packages\\coverlet.collector\\6.0.2\\coverlet.collector.6.0.2.nupkg.sha512",
     "C:\\Users\\muhamhad\\.nuget\\packages\\flaui.core\\5.0.0\\flaui.core.5.0.0.nupkg.sha512",

@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("FastFileExplorer.Tests")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4fbd5d172c7a99ee7b35d4c64d9da2f1f31002cc")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b94e4601c9c8f5ca3249678cb148faa7b9dcfbe8")]
 [assembly: System.Reflection.AssemblyProductAttribute("FastFileExplorer.Tests")]
 [assembly: System.Reflection.AssemblyTitleAttribute("FastFileExplorer.Tests")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

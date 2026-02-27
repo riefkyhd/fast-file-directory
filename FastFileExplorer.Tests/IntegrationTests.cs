@@ -248,31 +248,26 @@ public sealed class IntegrationTests
     [TestMethod]
     [TestCategory("Integration")]
     [Timeout(50000)]
-    public async Task Search_UsesPendingIndex_WhenStoreIsBusy()
+    public async Task Search_UsesMemoryIndex_WhenStoreIsBusy()
     {
         var root = TestDataHelper.CreateTestTree(fileCount: 12000, folderCount: 40);
         var cachePath = TestDataHelper.CreateTempCachePath();
         try
         {
+            var anchorName = "busy_lock_anchor_probe.txt";
+            File.WriteAllText(Path.Combine(root, anchorName), "anchor");
+
             using var service = new FileIndexService();
             _ = await service.LoadCacheAsync(cachePath, includeLowLevelContent: true);
+            await service.StartOrRebuildIndexAsync(new[] { root }, includeLowLevelContent: true);
 
-            var indexingTask = service.StartOrRebuildIndexAsync(new[] { root }, includeLowLevelContent: true);
-
-            var sawProgress = false;
-            service.StatusChanged += message =>
+            var baseline = service.Search("busy lock anchor probe", new SearchOptions
             {
-                if (message.Contains("scanned", StringComparison.OrdinalIgnoreCase))
-                {
-                    sawProgress = true;
-                }
-            };
-
-            var progressWaitStart = DateTime.UtcNow;
-            while (!sawProgress && (DateTime.UtcNow - progressWaitStart) < TimeSpan.FromSeconds(12))
-            {
-                await Task.Delay(50);
-            }
+                ItemFilter = ItemFilter.File,
+                DateFilter = DateFilter.All
+            }, limit: 25);
+            Assert.IsTrue(baseline.Any(r => r.Name.Equals(anchorName, StringComparison.OrdinalIgnoreCase)),
+                "Expected baseline anchor result before lock.");
 
             var connectionString = new SqliteConnectionStringBuilder
             {
@@ -306,12 +301,12 @@ public sealed class IntegrationTests
                 var started = DateTime.UtcNow;
                 while ((DateTime.UtcNow - started) < TimeSpan.FromSeconds(1))
                 {
-                    var results = service.Search("file 1", new SearchOptions
+                    var results = service.Search("busy lock anchor probe", new SearchOptions
                     {
                         ItemFilter = ItemFilter.File,
                         DateFilter = DateFilter.All
                     }, limit: 25);
-                    if (results.Count > 0)
+                    if (results.Any(r => r.Name.Equals(anchorName, StringComparison.OrdinalIgnoreCase)))
                     {
                         foundDuringLock = true;
                         break;
@@ -324,10 +319,8 @@ public sealed class IntegrationTests
                 unlockCommand.CommandText = "ROLLBACK;";
                 unlockCommand.ExecuteNonQuery();
 
-                Assert.IsTrue(foundDuringLock, "Expected search to return pending in-memory results when SQLite is busy.");
+                Assert.IsTrue(foundDuringLock, "Expected search to stay available from memory index when SQLite is busy.");
             }
-
-            await indexingTask;
         }
         finally
         {
@@ -506,6 +499,65 @@ public sealed class IntegrationTests
             var after = service.ItemCount;
 
             Assert.IsTrue(after >= before + 1, $"Continue index should retain existing items and add new ones. before={before}, after={after}");
+        }
+        finally
+        {
+            TestDataHelper.DeleteDirectoryWithRetry(root);
+            TestDataHelper.DeleteDirectoryWithRetry(Path.GetDirectoryName(cachePath)!);
+        }
+    }
+
+    [TestMethod]
+    [TestCategory("Integration")]
+    [Timeout(70000)]
+    public async Task Reindex_DoesNotDestroyActiveSearchCorpus_DuringBuild()
+    {
+        var root = TestDataHelper.CreateTestTree(fileCount: 4000, folderCount: 20);
+        var cachePath = TestDataHelper.CreateTempCachePath();
+        try
+        {
+            var anchor = Path.Combine(root, "always_find_me_anchor.txt");
+            File.WriteAllText(anchor, "anchor");
+
+            using var service = new FileIndexService();
+            _ = await service.LoadCacheAsync(cachePath, includeLowLevelContent: true);
+            await service.StartOrRebuildIndexAsync(new[] { root }, includeLowLevelContent: true);
+
+            var baseline = service.Search("always find me anchor", new SearchOptions
+            {
+                ItemFilter = ItemFilter.File,
+                DateFilter = DateFilter.All
+            }, limit: 20);
+            Assert.IsTrue(baseline.Any(i => i.Name.Equals("always_find_me_anchor.txt", StringComparison.OrdinalIgnoreCase)),
+                "Expected baseline anchor result before reindex.");
+
+            for (var i = 0; i < 12000; i++)
+            {
+                File.WriteAllText(Path.Combine(root, $"rebuild_heavy_{i:D5}.txt"), "x");
+            }
+
+            var reindexTask = service.StartOrRebuildIndexAsync(new[] { root }, includeLowLevelContent: true);
+            var stayedSearchable = false;
+            var started = DateTime.UtcNow;
+            while ((DateTime.UtcNow - started) < TimeSpan.FromSeconds(10))
+            {
+                var current = service.Search("always find me anchor", new SearchOptions
+                {
+                    ItemFilter = ItemFilter.File,
+                    DateFilter = DateFilter.All
+                }, limit: 20);
+
+                if (current.Any(i => i.Name.Equals("always_find_me_anchor.txt", StringComparison.OrdinalIgnoreCase)))
+                {
+                    stayedSearchable = true;
+                    break;
+                }
+
+                await Task.Delay(60);
+            }
+
+            await reindexTask;
+            Assert.IsTrue(stayedSearchable, "Active corpus became unavailable during reindex build.");
         }
         finally
         {

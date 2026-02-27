@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using System.Threading;
 using FastFileExplorer.Models;
 
@@ -6,307 +5,255 @@ namespace FastFileExplorer.Services;
 
 internal sealed class InMemorySearchIndex
 {
-    private readonly ReaderWriterLockSlim _gate = new(LockRecursionPolicy.NoRecursion);
+    private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
     private readonly Dictionary<string, IndexedItem> _itemsByPath = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<char, List<string>> _prefix1 = [];
-    private readonly Dictionary<string, List<string>> _prefix2 = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HashSet<string>> _prefix1 = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HashSet<string>> _prefix2 = new(StringComparer.Ordinal);
 
     public int Count
     {
         get
         {
-            _gate.EnterReadLock();
+            _lock.EnterReadLock();
             try
             {
                 return _itemsByPath.Count;
             }
             finally
             {
-                _gate.ExitReadLock();
+                _lock.ExitReadLock();
             }
         }
     }
 
-    public void Rebuild(IReadOnlyList<IndexedItem> items)
+    public void ReplaceAll(IReadOnlyList<IndexedItem> items)
     {
-        _gate.EnterWriteLock();
+        _lock.EnterWriteLock();
         try
         {
             _itemsByPath.Clear();
             _prefix1.Clear();
             _prefix2.Clear();
-
-            foreach (var item in items
-                         .OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase)
-                         .ThenBy(i => i.FullPath, StringComparer.OrdinalIgnoreCase))
+            foreach (var item in items)
             {
-                _itemsByPath[item.FullPath] = item;
-                AddPrefixes(item);
+                AddInternal(item);
             }
         }
         finally
         {
-            _gate.ExitWriteLock();
+            _lock.ExitWriteLock();
         }
     }
 
     public void Upsert(IndexedItem item)
     {
-        _gate.EnterWriteLock();
+        _lock.EnterWriteLock();
         try
         {
-            if (_itemsByPath.TryGetValue(item.FullPath, out var existing))
+            if (_itemsByPath.TryGetValue(item.FullPath, out var previous))
             {
-                RemovePrefixes(existing);
+                RemovePrefixes(previous);
             }
 
-            _itemsByPath[item.FullPath] = item;
-            AddPrefixes(item);
+            AddInternal(item);
         }
         finally
         {
-            _gate.ExitWriteLock();
+            _lock.ExitWriteLock();
         }
     }
 
     public void Remove(string fullPath)
     {
-        _gate.EnterWriteLock();
+        _lock.EnterWriteLock();
         try
         {
-            if (!_itemsByPath.TryGetValue(fullPath, out var existing))
+            if (!_itemsByPath.TryGetValue(fullPath, out var previous))
             {
                 return;
             }
 
+            RemovePrefixes(previous);
             _itemsByPath.Remove(fullPath);
-            RemovePrefixes(existing);
         }
         finally
         {
-            _gate.ExitWriteLock();
+            _lock.ExitWriteLock();
         }
     }
 
-    public IReadOnlyList<IndexedItem> SearchFastCandidates(string query, SearchOptions options, int limit)
+    public IReadOnlyList<IndexedItem> SearchFastCandidates(string normalizedQuery, SearchOptions options, int limit)
     {
-        return SearchCore(query, options, limit, candidateMultiplier: 4, candidateCeiling: 500, fullMode: false);
+        return SearchInternal(normalizedQuery, options, limit, fullRelevance: false);
     }
 
-    public IReadOnlyList<IndexedItem> SearchFullRelevance(string query, SearchOptions options, int limit)
+    public IReadOnlyList<IndexedItem> SearchFullRelevance(string normalizedQuery, SearchOptions options, int limit)
     {
-        return SearchCore(query, options, limit, candidateMultiplier: 14, candidateCeiling: 4500, fullMode: true);
+        return SearchInternal(normalizedQuery, options, limit, fullRelevance: true);
     }
 
-    private IReadOnlyList<IndexedItem> SearchCore(
-        string query,
-        SearchOptions options,
-        int limit,
-        int candidateMultiplier,
-        int candidateCeiling,
-        bool fullMode)
+    private IReadOnlyList<IndexedItem> SearchInternal(string normalizedQuery, SearchOptions options, int limit, bool fullRelevance)
     {
         if (limit <= 0)
         {
             return [];
         }
 
-        var terms = NormalizeTerms(query);
+        var terms = SplitTerms(normalizedQuery);
         if (terms.Length == 0)
         {
             return [];
         }
 
-        var candidateTarget = Math.Min(candidateCeiling, Math.Max(limit, limit * candidateMultiplier));
-        var firstTerm = terms[0];
-
-        List<IndexedItem> candidates = [];
-
-        _gate.EnterReadLock();
+        _lock.EnterReadLock();
         try
         {
-            foreach (var path in GetCandidatePaths(firstTerm))
+            var prefixOptimized = terms.Length == 1 && terms[0].Length <= 2;
+            IEnumerable<IndexedItem> candidates = ResolveCandidates(terms[0]);
+
+            var filtered = new List<IndexedItem>(Math.Min(limit * 6, 2000));
+            var fastPhaseCap = prefixOptimized ? Math.Max(limit * 2, limit) : Math.Max(limit * 8, limit);
+            foreach (var item in candidates)
             {
-                if (!_itemsByPath.TryGetValue(path, out var item))
+                if (!prefixOptimized &&
+                    !terms.All(term => item.NormalizedName.Contains(term, StringComparison.Ordinal)))
                 {
                     continue;
                 }
 
-                if (!PassesTerms(item, terms) ||
-                    !PassesItemFilter(item, options.ItemFilter) ||
-                    !PassesDateFilter(item, options.DateFilter))
+                if (!PassesItemFilter(item, options.ItemFilter) || !PassesDateFilter(item, options.DateFilter))
                 {
                     continue;
                 }
 
-                candidates.Add(item);
-                if (candidates.Count >= candidateTarget)
+                filtered.Add(item);
+                if (!fullRelevance && filtered.Count >= fastPhaseCap)
                 {
                     break;
                 }
             }
 
-            if (candidates.Count == 0)
-            {
-                // Fallback for uncommon names where prefix buckets miss.
-                foreach (var item in _itemsByPath.Values)
-                {
-                    if (!PassesTerms(item, terms) ||
-                        !PassesItemFilter(item, options.ItemFilter) ||
-                        !PassesDateFilter(item, options.DateFilter))
-                    {
-                        continue;
-                    }
-
-                    candidates.Add(item);
-                    if (candidates.Count >= candidateTarget)
-                    {
-                        break;
-                    }
-                }
-            }
+            var firstTerm = terms[0];
+            return fullRelevance
+                ? filtered
+                    .OrderBy(item => GetRelevanceRank(item, firstTerm))
+                    .ThenBy(item => item.Kind == IndexedItemKind.Folder ? 0 : 1)
+                    .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+                    .ThenByDescending(item => item.LastWriteTimeUtc)
+                    .ThenBy(item => item.FullPath, StringComparer.OrdinalIgnoreCase)
+                    .Take(limit)
+                    .ToList()
+                : filtered
+                    .OrderBy(item => GetRelevanceRank(item, firstTerm))
+                    .ThenBy(item => item.Kind == IndexedItemKind.Folder ? 0 : 1)
+                    .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(item => item.FullPath, StringComparer.OrdinalIgnoreCase)
+                    .Take(limit)
+                    .ToList();
         }
         finally
         {
-            _gate.ExitReadLock();
+            _lock.ExitReadLock();
         }
-
-        return SortDeterministically(candidates, firstTerm, limit, fullMode);
     }
 
-    private IEnumerable<string> GetCandidatePaths(string firstTerm)
+    private IEnumerable<IndexedItem> ResolveCandidates(string firstTerm)
     {
-        if (string.IsNullOrWhiteSpace(firstTerm))
+        if (firstTerm.Length >= 2 &&
+            _prefix2.TryGetValue(firstTerm[..2], out var prefix2Set) &&
+            prefix2Set.Count > 0)
         {
-            return [];
+            return prefix2Set
+                .Select(path => _itemsByPath.TryGetValue(path, out var item) ? item : null)
+                .Where(item => item is not null)!;
         }
 
-        if (firstTerm.Length == 1)
+        if (firstTerm.Length >= 1 &&
+            _prefix1.TryGetValue(firstTerm[..1], out var prefix1Set) &&
+            prefix1Set.Count > 0)
         {
-            var c = firstTerm[0];
-            return _prefix1.TryGetValue(c, out var list) ? list : [];
+            return prefix1Set
+                .Select(path => _itemsByPath.TryGetValue(path, out var item) ? item : null)
+                .Where(item => item is not null)!;
         }
 
-        var key = firstTerm[..2];
-        return _prefix2.TryGetValue(key, out var pairList) ? pairList : [];
+        return _itemsByPath.Values;
     }
 
-    private void AddPrefixes(IndexedItem item)
+    private void AddInternal(IndexedItem item)
     {
-        foreach (var token in SplitNameTokens(item.NormalizedName))
+        _itemsByPath[item.FullPath] = item;
+        if (string.IsNullOrWhiteSpace(item.NormalizedName))
         {
-            if (token.Length == 0)
-            {
-                continue;
-            }
+            return;
+        }
 
-            var k1 = token[0];
-            if (!_prefix1.TryGetValue(k1, out var list1))
-            {
-                list1 = [];
-                _prefix1[k1] = list1;
-            }
-            list1.Add(item.FullPath);
+        var compact = CompactNormalized(item.NormalizedName);
+        if (compact.Length == 0)
+        {
+            return;
+        }
 
-            if (token.Length >= 2)
-            {
-                var k2 = token[..2];
-                if (!_prefix2.TryGetValue(k2, out var list2))
-                {
-                    list2 = [];
-                    _prefix2[k2] = list2;
-                }
-                list2.Add(item.FullPath);
-            }
+        var p1 = compact[..1];
+        AddPrefix(_prefix1, p1, item.FullPath);
+        if (compact.Length >= 2)
+        {
+            var p2 = compact[..2];
+            AddPrefix(_prefix2, p2, item.FullPath);
         }
     }
 
     private void RemovePrefixes(IndexedItem item)
     {
-        foreach (var token in SplitNameTokens(item.NormalizedName))
+        var compact = CompactNormalized(item.NormalizedName);
+        if (compact.Length == 0)
         {
-            if (token.Length == 0)
-            {
-                continue;
-            }
+            return;
+        }
 
-            var k1 = token[0];
-            if (_prefix1.TryGetValue(k1, out var list1))
-            {
-                list1.Remove(item.FullPath);
-                if (list1.Count == 0)
-                {
-                    _prefix1.Remove(k1);
-                }
-            }
-
-            if (token.Length >= 2)
-            {
-                var k2 = token[..2];
-                if (_prefix2.TryGetValue(k2, out var list2))
-                {
-                    list2.Remove(item.FullPath);
-                    if (list2.Count == 0)
-                    {
-                        _prefix2.Remove(k2);
-                    }
-                }
-            }
+        var p1 = compact[..1];
+        RemovePrefix(_prefix1, p1, item.FullPath);
+        if (compact.Length >= 2)
+        {
+            var p2 = compact[..2];
+            RemovePrefix(_prefix2, p2, item.FullPath);
         }
     }
 
-    private static IReadOnlyList<IndexedItem> SortDeterministically(
-        IEnumerable<IndexedItem> source,
-        string firstTerm,
-        int limit,
-        bool fullMode)
+    private static void AddPrefix(Dictionary<string, HashSet<string>> map, string key, string fullPath)
     {
-        if (fullMode)
+        if (!map.TryGetValue(key, out var set))
         {
-            return source
-                .OrderBy(item => GetRelevanceRank(item, firstTerm))
-                .ThenBy(item => item.Kind == IndexedItemKind.Folder ? 0 : 1)
-                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
-                .ThenByDescending(item => item.LastWriteTimeUtc)
-                .ThenBy(item => item.FullPath, StringComparer.OrdinalIgnoreCase)
-                .Take(limit)
-                .ToList();
+            set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            map[key] = set;
         }
 
-        return source
-            .OrderBy(item => GetRelevanceRank(item, firstTerm))
-            .ThenBy(item => item.Kind == IndexedItemKind.Folder ? 0 : 1)
-            .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(item => item.FullPath, StringComparer.OrdinalIgnoreCase)
-            .Take(limit)
-            .ToList();
+        set.Add(fullPath);
     }
 
-    private static bool PassesTerms(IndexedItem item, string[] terms)
+    private static void RemovePrefix(Dictionary<string, HashSet<string>> map, string key, string fullPath)
     {
-        foreach (var term in terms)
+        if (!map.TryGetValue(key, out var set))
         {
-            if (!item.NormalizedName.Contains(term, StringComparison.Ordinal))
-            {
-                return false;
-            }
+            return;
         }
-        return true;
+
+        set.Remove(fullPath);
+        if (set.Count == 0)
+        {
+            map.Remove(key);
+        }
     }
 
-    private static IEnumerable<string> SplitNameTokens(string normalizedName)
+    private static string CompactNormalized(string normalizedName)
     {
-        return normalizedName.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return new string(normalizedName.Where(char.IsLetterOrDigit).ToArray());
     }
 
-    private static string[] NormalizeTerms(string query)
+    private static string[] SplitTerms(string normalizedQuery)
     {
-        var normalized = new string(query
-            .ToLowerInvariant()
-            .Select(c => char.IsLetterOrDigit(c) ? c : ' ')
-            .ToArray());
-
-        return normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return normalizedQuery
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     }
 
     private static int GetRelevanceRank(IndexedItem item, string firstTerm)

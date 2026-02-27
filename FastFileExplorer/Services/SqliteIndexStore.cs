@@ -6,11 +6,22 @@ namespace FastFileExplorer.Services;
 
 public sealed class SqliteIndexStore
 {
-    public sealed record StoreMetadata(bool IncludeLowLevelContent, int ItemCount);
+    public const string IndexStateComplete = "complete";
+    public const string IndexStateIncomplete = "incomplete";
+    public const string IndexStateUnknown = "unknown";
+
+    public sealed record StoreMetadata(
+        bool IncludeLowLevelContent,
+        int ItemCount,
+        string IndexState,
+        DateTime? LastSuccessfulFullScanUtc,
+        int ItemCountCheckpoint);
 
     private readonly string _dbPath;
     private readonly string _connectionString;
     private int _ftsHasRows = -1;
+
+    public string DbPath => _dbPath;
 
     public SqliteIndexStore(string dbPath)
     {
@@ -69,6 +80,8 @@ public sealed class SqliteIndexStore
             CREATE INDEX IF NOT EXISTS idx_items_last_write_ticks ON items(last_write_ticks);
             CREATE INDEX IF NOT EXISTS idx_items_normalized_name ON items(normalized_name);
             CREATE INDEX IF NOT EXISTS idx_items_norm_name_sort ON items(normalized_name, name, last_write_ticks);
+            INSERT INTO metadata(key, value) VALUES ('index_state', 'unknown')
+            ON CONFLICT(key) DO NOTHING;
             """;
         command.ExecuteNonQuery();
     }
@@ -84,20 +97,34 @@ public sealed class SqliteIndexStore
     public StoreMetadata? TryReadMetadata()
     {
         using var connection = OpenConnection();
-        using var includeCommand = connection.CreateCommand();
-        includeCommand.CommandText = "SELECT value FROM metadata WHERE key = 'include_low_level_content' LIMIT 1;";
-        var includeValue = includeCommand.ExecuteScalar() as string;
+        var includeValue = TryGetMetadataValue(connection, "include_low_level_content");
         if (includeValue is null)
         {
             return null;
         }
 
         var includeLowLevel = string.Equals(includeValue, "1", StringComparison.OrdinalIgnoreCase);
+        var indexState = TryGetMetadataValue(connection, "index_state") ?? IndexStateUnknown;
+        var lastScanText = TryGetMetadataValue(connection, "last_successful_full_scan_utc");
+        var checkpointText = TryGetMetadataValue(connection, "item_count_checkpoint");
 
         using var countCommand = connection.CreateCommand();
         countCommand.CommandText = "SELECT COUNT(*) FROM items;";
         var count = Convert.ToInt32(countCommand.ExecuteScalar());
-        return new StoreMetadata(includeLowLevel, count);
+
+        DateTime? lastSuccessfulFullScanUtc = null;
+        if (DateTime.TryParse(lastScanText, out var parsedLastScan))
+        {
+            lastSuccessfulFullScanUtc = DateTime.SpecifyKind(parsedLastScan, DateTimeKind.Utc);
+        }
+
+        var checkpoint = 0;
+        if (int.TryParse(checkpointText, out var parsedCheckpoint))
+        {
+            checkpoint = parsedCheckpoint;
+        }
+
+        return new StoreMetadata(includeLowLevel, count, indexState, lastSuccessfulFullScanUtc, checkpoint);
     }
 
     public List<IndexedItem> LoadAllItems()
@@ -142,12 +169,68 @@ public sealed class SqliteIndexStore
             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             INSERT INTO metadata(key, value) VALUES ('updated_utc', $updated)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            INSERT INTO metadata(key, value) VALUES ('index_state', $index_state)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            INSERT INTO metadata(key, value) VALUES ('item_count_checkpoint', '0')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             """;
         command.Parameters.AddWithValue("$include", includeLowLevelContent ? "1" : "0");
         command.Parameters.AddWithValue("$updated", DateTime.UtcNow.ToString("O"));
+        command.Parameters.AddWithValue("$index_state", IndexStateIncomplete);
         command.ExecuteNonQuery();
         transaction.Commit();
         Interlocked.Exchange(ref _ftsHasRows, 0);
+    }
+
+    public void SetIndexState(string state)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO metadata(key, value) VALUES ('index_state', $state)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            INSERT INTO metadata(key, value) VALUES ('updated_utc', $updated)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """;
+        command.Parameters.AddWithValue("$state", state);
+        command.Parameters.AddWithValue("$updated", DateTime.UtcNow.ToString("O"));
+        command.ExecuteNonQuery();
+    }
+
+    public void MarkFullScanCompleted(int itemCountCheckpoint)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO metadata(key, value) VALUES ('index_state', $state)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            INSERT INTO metadata(key, value) VALUES ('last_successful_full_scan_utc', $last_scan)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            INSERT INTO metadata(key, value) VALUES ('item_count_checkpoint', $count_checkpoint)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            INSERT INTO metadata(key, value) VALUES ('updated_utc', $updated)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """;
+        command.Parameters.AddWithValue("$state", IndexStateComplete);
+        command.Parameters.AddWithValue("$last_scan", DateTime.UtcNow.ToString("O"));
+        command.Parameters.AddWithValue("$count_checkpoint", itemCountCheckpoint.ToString());
+        command.Parameters.AddWithValue("$updated", DateTime.UtcNow.ToString("O"));
+        command.ExecuteNonQuery();
+    }
+
+    public void SetItemCountCheckpoint(int itemCountCheckpoint)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO metadata(key, value) VALUES ('item_count_checkpoint', $count_checkpoint)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            INSERT INTO metadata(key, value) VALUES ('updated_utc', $updated)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """;
+        command.Parameters.AddWithValue("$count_checkpoint", itemCountCheckpoint.ToString());
+        command.Parameters.AddWithValue("$updated", DateTime.UtcNow.ToString("O"));
+        command.ExecuteNonQuery();
     }
 
     public void ApplyChanges(IReadOnlyCollection<IndexedItem> upserts, IReadOnlyCollection<string> deletes, bool includeLowLevelContent)
@@ -542,6 +625,14 @@ public sealed class SqliteIndexStore
 
         whereParts.Add("i.last_write_ticks >= $minTicks");
         command.Parameters.AddWithValue("$minTicks", minUtc.Ticks);
+    }
+
+    private static string? TryGetMetadataValue(SqliteConnection connection, string key)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT value FROM metadata WHERE key = $key LIMIT 1;";
+        command.Parameters.AddWithValue("$key", key);
+        return command.ExecuteScalar() as string;
     }
 
     private bool HasFtsRows(SqliteConnection connection)

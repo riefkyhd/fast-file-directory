@@ -338,11 +338,11 @@
   "project": {
     "version": "1.1.6",
     "restore": {
-      "projectUniqueName": "D:\\Personal\\photography-portfolio\\photo-portfolio\\FastFileExplorer\\FastFileExplorer.csproj",
+      "projectUniqueName": "D:\\Personal\\fast-file-explorer\\FastFileExplorer\\FastFileExplorer.csproj",
       "projectName": "FastFileExplorer",
-      "projectPath": "D:\\Personal\\photography-portfolio\\photo-portfolio\\FastFileExplorer\\FastFileExplorer.csproj",
+      "projectPath": "D:\\Personal\\fast-file-explorer\\FastFileExplorer\\FastFileExplorer.csproj",
       "packagesPath": "C:\\Users\\muhamhad\\.nuget\\packages\\",
-      "outputPath": "D:\\Personal\\photography-portfolio\\photo-portfolio\\FastFileExplorer\\obj\\",
+      "outputPath": "D:\\Personal\\fast-file-explorer\\FastFileExplorer\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"

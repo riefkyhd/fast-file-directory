@@ -14,6 +14,8 @@ public static class SettingsService
 {
     private const string FileName = "settings.json";
     private const string CacheDbFileName = "index-cache-v2.db";
+    private const string BuildCacheDbFileName = "index-cache-v2.build.db";
+    private const string PreviousCacheDbFileName = "index-cache-v2.prev.db";
     private const string LegacyCacheFileName = "index-cache-v1.json";
 
     public static AppSettings Load()
@@ -70,6 +72,44 @@ public static class SettingsService
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "FastFileExplorer",
             CacheDbFileName);
+    }
+
+    public static string GetDefaultBuildCachePath()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "FastFileExplorer",
+            BuildCacheDbFileName);
+    }
+
+    public static string GetDefaultPreviousCachePath()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "FastFileExplorer",
+            PreviousCacheDbFileName);
+    }
+
+    public static string GetBuildCachePath(string activeCachePath)
+    {
+        var directory = Path.GetDirectoryName(activeCachePath);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            return GetDefaultBuildCachePath();
+        }
+
+        return Path.Combine(directory, BuildCacheDbFileName);
+    }
+
+    public static string GetPreviousCachePath(string activeCachePath)
+    {
+        var directory = Path.GetDirectoryName(activeCachePath);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            return GetDefaultPreviousCachePath();
+        }
+
+        return Path.Combine(directory, PreviousCacheDbFileName);
     }
 
     public static string GetDefaultLegacyJsonPath()

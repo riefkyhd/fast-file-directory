@@ -11,11 +11,15 @@ public sealed class FileIconProvider
 {
     private readonly ConcurrentDictionary<string, ImageSource> _cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ImageSource _fallbackIcon;
+    private readonly ImageSource _folderIcon;
 
     public FileIconProvider()
     {
         var fallbackHandle = GetSystemIconHandleForFile("file.txt");
         _fallbackIcon = fallbackHandle != IntPtr.Zero ? CreateIconSource(fallbackHandle) : CreateGeometryFallbackIcon();
+        var folderHandle = GetSystemIconHandleForFolder();
+        _folderIcon = folderHandle != IntPtr.Zero ? CreateIconSource(folderHandle) : _fallbackIcon;
+        _cache["__folder__"] = _folderIcon;
     }
 
     public ImageSource GetIcon(IndexedItem item)
@@ -23,9 +27,14 @@ public sealed class FileIconProvider
         var key = item.Kind == IndexedItemKind.Folder ? "__folder__" : item.Extension;
         return _cache.GetOrAdd(key, _ =>
         {
+            var probePath = item.Kind == IndexedItemKind.Folder
+                ? string.Empty
+                : item.Extension is "(none)" or "folder" or null
+                    ? "file"
+                    : $"file.{item.Extension}";
             var iconHandle = item.Kind == IndexedItemKind.Folder
                 ? GetSystemIconHandleForFolder()
-                : GetSystemIconHandleForFile(item.FullPath);
+                : GetSystemIconHandleForFile(probePath);
 
             if (iconHandle == IntPtr.Zero)
             {
@@ -34,6 +43,11 @@ public sealed class FileIconProvider
 
             return CreateIconSource(iconHandle);
         });
+    }
+
+    public ImageSource GetQuickIcon(IndexedItem item)
+    {
+        return item.Kind == IndexedItemKind.Folder ? _folderIcon : _fallbackIcon;
     }
 
     private ImageSource CreateIconSource(IntPtr iconHandle)
